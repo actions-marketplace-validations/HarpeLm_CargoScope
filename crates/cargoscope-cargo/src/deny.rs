@@ -10,7 +10,8 @@
 use std::path::{Path, PathBuf};
 
 use cargoscope_core::policy::{
-    Ban, Features, LicenseClarification, LicenseException, Policy, UnknownLicense,
+    Ban, BuildScriptAllow, FeatureBan, Features, LicenseClarification, LicenseException,
+    LicenseFileHash, LintLevel, Policy, UnknownLicense,
 };
 
 use crate::config::AdvisoryIgnore;
@@ -57,8 +58,11 @@ pub fn load(project_root: &Path) -> Result<Option<Translation>, String> {
     };
     let text =
         std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let (policy, ignores, notes) =
+    let (mut policy, ignores, notes) =
         translate(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    if let Some(policy) = &mut policy {
+        policy.root_package_only = has_root_package(project_root);
+    }
     Ok(Some(Translation {
         path,
         policy,
@@ -67,11 +71,18 @@ pub fn load(project_root: &Path) -> Result<Option<Translation>, String> {
     }))
 }
 
+fn has_root_package(project_root: &Path) -> bool {
+    std::fs::read_to_string(project_root.join("Cargo.toml"))
+        .ok()
+        .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+        .is_some_and(|table| table.contains_key("package") && table.contains_key("workspace"))
+}
+
 /// A crate named by cargo-deny: `"name"`, `"name@version"`, `"name:req"`,
 /// or a table with `crate` (one of those) or `name` and `version`. The
 /// version becomes a requirement (`=1.2.3` for an exact version, `None` for
 /// any).
-fn crate_spec(value: &toml::Value) -> Option<(String, Option<String>)> {
+pub(crate) fn crate_spec(value: &toml::Value) -> Option<(String, Option<String>)> {
     let (spec, version) = match value {
         toml::Value::String(spec) => (spec.clone(), None),
         toml::Value::Table(table) => {
@@ -157,7 +168,24 @@ pub fn translate(text: &str) -> Result<Translated, String> {
             }
         };
 
-    if let Some(graph) = table("graph") {
+    // Before [graph] existed, these keys sat at the top level; cargo-deny
+    // 0.20 still reads them there, over [graph].
+    let mut merged_graph = table("graph").cloned();
+    for key in [
+        "targets",
+        "exclude",
+        "features",
+        "all-features",
+        "no-default-features",
+        "exclude-dev",
+    ] {
+        if let Some(value) = value.get(key) {
+            merged_graph
+                .get_or_insert_with(toml::Table::new)
+                .insert(key.to_owned(), value.clone());
+        }
+    }
+    if let Some(graph) = merged_graph.as_ref() {
         for target in graph
             .get("targets")
             .and_then(toml::Value::as_array)
@@ -218,6 +246,36 @@ pub fn translate(text: &str) -> Result<Translated, String> {
         has_rules = true;
         policy.check_licenses = true;
         policy.unknown_license = UnknownLicense::Deny;
+        // cargo-deny leaves licenses of dev-dependencies out by default.
+        policy.licenses_exclude_dev =
+            licenses.get("include-dev").and_then(toml::Value::as_bool) != Some(true);
+        // cargo-deny checks every crate of the graph, the project's own too.
+        policy.licenses_include_workspace = true;
+        policy.empty_allow_denies_all = true;
+        if let Some(value) = licenses.get("confidence-threshold") {
+            match crate::config::confidence_threshold(value) {
+                Some(threshold) => policy.confidence_threshold = threshold,
+                None => notes.push(
+                    "deny.toml: [licenses] confidence-threshold is not a number from 0.0 to 1.0, 0.8 used"
+                        .to_owned(),
+                ),
+            }
+        }
+        // cargo-deny warns about allowed licenses no crate uses by default.
+        policy.unused_allowed_license = match licenses
+            .get("unused-allowed-license")
+            .and_then(toml::Value::as_str)
+        {
+            Some("allow") => LintLevel::Allow,
+            Some("deny") => LintLevel::Deny,
+            _ => LintLevel::Warn,
+        };
+        if let Some(private) = licenses.get("private").and_then(toml::Value::as_table) {
+            policy.private_ignore =
+                private.get("ignore").and_then(toml::Value::as_bool) == Some(true);
+            policy.private_registries = strings(private, "registries");
+            policy.private_ignore_sources = strings(private, "ignore-sources");
+        }
         let valid = |license: &String, notes: &mut Vec<String>| {
             let ok = cargoscope_core::license::parse(license).is_ok();
             if !ok {
@@ -236,7 +294,10 @@ pub fn translate(text: &str) -> Result<Translated, String> {
             .filter(|license| valid(license, &mut notes))
             .collect();
         if policy.allow_licenses.is_empty() {
-            notes.push("deny.toml: [licenses] allow is empty: cargo-deny then rejects every license, CargoScope accepts any license not denied".to_owned());
+            notes.push(
+                "deny.toml: [licenses] allow is empty: every license is rejected, as in cargo-deny"
+                    .to_owned(),
+            );
         }
         for entry in licenses
             .get("exceptions")
@@ -266,7 +327,6 @@ pub fn translate(text: &str) -> Result<Translated, String> {
                 reason: reason(entry),
             });
         }
-        let mut hashes = false;
         for entry in licenses
             .get("clarify")
             .and_then(toml::Value::as_array)
@@ -284,16 +344,49 @@ pub fn translate(text: &str) -> Result<Translated, String> {
                 notes.push(format!("deny.toml: the clarification of `{name}` (`{expression}`) cannot be read, ignored"));
                 continue;
             }
-            hashes |= entry.get("license-files").is_some();
+            let mut license_files = Vec::new();
+            for file in entry
+                .get("license-files")
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(path) = file.get("path").and_then(toml::Value::as_str) else {
+                    notes.push(format!(
+                        "deny.toml: a license-files entry for `{name}` without a `path` was ignored"
+                    ));
+                    continue;
+                };
+                let hash = match file.get("hash") {
+                    None => None,
+                    Some(toml::Value::Integer(value)) => match u32::try_from(*value) {
+                        Ok(hash) => Some(hash),
+                        Err(_) => {
+                            notes.push(format!(
+                                "deny.toml: license-files hash for `{name}` (`{path}`) is out of 32-bit range, ignored"
+                            ));
+                            None
+                        }
+                    },
+                    Some(_) => {
+                        notes.push(format!(
+                            "deny.toml: license-files hash for `{name}` (`{path}`) is not an integer, ignored"
+                        ));
+                        None
+                    }
+                };
+                license_files.push(LicenseFileHash {
+                    path: path.to_owned(),
+                    hash,
+                });
+            }
             policy.license_clarifications.push(LicenseClarification {
                 name,
                 version,
                 expression: expression.to_owned(),
                 reason: reason(entry),
+                license_files,
             });
-        }
-        if hashes {
-            notes.push("deny.toml: the license-files hashes of clarifications are not checked: a clarification still applies after the license files change".to_owned());
         }
         unsupported(
             &mut notes,
@@ -305,7 +398,10 @@ pub fn translate(text: &str) -> Result<Translated, String> {
                 "exceptions",
                 "clarify",
                 "version",
+                "include-dev",
                 "unused-allowed-license",
+                "confidence-threshold",
+                "private",
             ],
         );
     }
@@ -352,8 +448,8 @@ pub fn translate(text: &str) -> Result<Translated, String> {
             .and_then(toml::Value::as_bool)
             != Some(true);
         match bans.get("multiple-versions").and_then(toml::Value::as_str) {
-            Some("deny") => policy.deny_multiple_versions = true,
-            Some("warn") => notes.push("deny.toml: multiple-versions = \"warn\": duplicates are listed in the report but do not fail the scan".to_owned()),
+            Some("deny") => policy.multiple_versions = LintLevel::Deny,
+            Some("warn") => policy.multiple_versions = LintLevel::Warn,
             _ => {}
         }
         policy.skip_multiple_versions = bans
@@ -377,12 +473,80 @@ pub fn translate(text: &str) -> Result<Translated, String> {
                 crate_spec(entry).map(|(name, _)| (name, depth))
             })
             .collect();
+        for entry in bans
+            .get("features")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some((name, version)) = crate_spec(entry) else {
+                continue;
+            };
+            let Some(entry_table) = entry.as_table() else {
+                continue;
+            };
+            policy.feature_bans.push(FeatureBan {
+                name,
+                version,
+                allow: strings(entry_table, "allow"),
+                deny: strings(entry_table, "deny"),
+                exact: entry_table
+                    .get("exact")
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(false),
+                reason: reason(entry),
+            });
+        }
+        if let Some(build) = bans.get("build").and_then(toml::Value::as_table) {
+            policy.build_include_workspace = build
+                .get("include-workspace")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false);
+            if let Some(allow) = build
+                .get("allow-build-scripts")
+                .and_then(toml::Value::as_array)
+            {
+                policy.allow_build_scripts = Some(
+                    allow
+                        .iter()
+                        .filter_map(|entry| {
+                            crate_spec(entry)
+                                .map(|(name, version)| BuildScriptAllow { name, version })
+                        })
+                        .collect(),
+                );
+            }
+            match crate::config::build_inspection(build) {
+                Ok(inspection) => policy.build_inspection = Some(inspection),
+                Err(error) => notes.push(format!(
+                    "deny.toml: {error}; executables and scripts in crates are not inspected"
+                )),
+            }
+            unsupported(
+                &mut notes,
+                "bans.build",
+                build,
+                &[
+                    "allow-build-scripts",
+                    "include-workspace",
+                    "executables",
+                    "interpreted",
+                    "script-extensions",
+                    "enable-builtin-globs",
+                    "include-dependencies",
+                    "include-archives",
+                    "bypass",
+                ],
+            );
+        }
         unsupported(
             &mut notes,
             "bans",
             bans,
             &[
                 "deny",
+                "features",
+                "build",
                 "multiple-versions",
                 "skip",
                 "skip-tree",
@@ -396,14 +560,17 @@ pub fn translate(text: &str) -> Result<Translated, String> {
 
     if let Some(sources) = table("sources") {
         has_rules = true;
-        let level = |key: &str| {
-            sources
-                .get(key)
-                .and_then(toml::Value::as_str)
-                .unwrap_or("warn")
+        let level = |key: &str| match sources
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .unwrap_or("warn")
+        {
+            "allow" => LintLevel::Allow,
+            "deny" => LintLevel::Deny,
+            _ => LintLevel::Warn,
         };
         let (registry, git) = (level("unknown-registry"), level("unknown-git"));
-        if registry == "deny" || git == "deny" {
+        if registry != LintLevel::Allow || git != LintLevel::Allow {
             policy.allow_registries = Some(
                 strings(sources, "allow-registry")
                     .into_iter()
@@ -431,9 +598,8 @@ pub fn translate(text: &str) -> Result<Translated, String> {
                     );
                 }
             }
-            if registry != git {
-                notes.push(format!("deny.toml: unknown-registry = \"{registry}\" and unknown-git = \"{git}\": CargoScope enforces both sources"));
-            }
+            policy.registry_source_level = registry;
+            policy.git_source_level = git;
         }
         unsupported(
             &mut notes,
@@ -466,6 +632,7 @@ pub fn translate(text: &str) -> Result<Translated, String> {
                     id: id.to_owned(),
                     reason: reason(entry),
                     until: None,
+                    source: "deny.toml",
                 }),
                 None => notes.push("deny.toml: an advisory ignore that names a crate instead of an advisory ID is not supported, ignored".to_owned()),
             }
@@ -511,6 +678,25 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_graph_keys_of_older_configurations_at_the_top_level() {
+        let (policy, _, _) = translate(
+            "targets = [{ triple = \"x86_64-unknown-linux-gnu\" }, \"aarch64-apple-darwin\"]\nall-features = true\n[licenses]\nallow = [\"MIT\"]\n",
+        )
+        .expect("valid");
+        let policy = policy.expect("rules");
+        assert_eq!(
+            policy.targets,
+            vec!["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+        );
+        assert!(
+            policy
+                .features
+                .as_ref()
+                .is_some_and(|features| features.all)
+        );
+    }
+
+    #[test]
     fn translates_a_cargo_deny_configuration() {
         let text = r#"
 [graph]
@@ -536,6 +722,8 @@ multiple-versions = "deny"
 deny = ["openssl", { crate = "git2@0.18", reason = "use gix", wrappers = ["tool"] }, { name = "ahash", deny-multiple-versions = true }]
 skip = [{ crate = "windows-sys@0.45", reason = "old" }]
 skip-tree = ["criterion"]
+features = [{ crate = "derive_more", deny = ["error"], allow = ["default"], exact = true }]
+workspace-default-features = "deny"
 
 [sources]
 unknown-registry = "deny"
@@ -565,7 +753,18 @@ github = ["myorg"]
             policy.license_clarifications[0].expression,
             "MIT AND ISC AND OpenSSL"
         );
-        assert!(policy.deny_multiple_versions);
+        assert_eq!(
+            policy.license_clarifications[0].license_files[0].path,
+            "LICENSE"
+        );
+        assert_eq!(
+            policy.license_clarifications[0].license_files[0].hash,
+            Some(0xbd0e_ed23)
+        );
+        assert_eq!(
+            policy.multiple_versions,
+            cargoscope_core::policy::LintLevel::Deny
+        );
         assert_eq!(policy.bans.len(), 2);
         assert_eq!(policy.bans[1].version.as_deref(), Some("0.18"));
         assert_eq!(policy.skip_multiple_versions, vec!["windows-sys"]);
@@ -582,11 +781,14 @@ github = ["myorg"]
         assert_eq!(ignores[1].reason, "only on Windows");
 
         let notes = notes.join("\n");
-        assert!(
-            notes.contains("[licenses] confidence-threshold not supported"),
-            "{notes}"
+        assert!(!notes.contains("confidence-threshold"), "{notes}");
+        assert_eq!(policy.confidence_threshold, 800);
+        assert!(policy.licenses_include_workspace);
+        assert_eq!(
+            policy.unused_allowed_license,
+            cargoscope_core::policy::LintLevel::Warn
         );
-        assert!(notes.contains("license-files hashes"), "{notes}");
+        assert!(!notes.contains("license-files hashes"), "{notes}");
         assert_eq!(policy.bans[1].wrappers, vec!["tool"]);
         assert_eq!(
             policy.skip_multiple_versions_trees,
@@ -594,25 +796,98 @@ github = ["myorg"]
         );
         assert!(policy.features.is_some(), "default features, as cargo-deny");
         assert!(
+            policy.licenses_exclude_dev,
+            "include-dev defaults to false in cargo-deny"
+        );
+        assert_eq!(policy.feature_bans.len(), 1);
+        assert_eq!(policy.feature_bans[0].name, "derive_more");
+        assert_eq!(policy.feature_bans[0].deny, vec!["error"]);
+        assert_eq!(policy.feature_bans[0].allow, vec!["default"]);
+        assert!(policy.feature_bans[0].exact);
+        assert_eq!(policy.feature_bans[0].reason, "from deny.toml");
+        assert!(
+            notes.contains("[bans] workspace-default-features not supported"),
+            "{notes}"
+        );
+        assert!(
             notes.contains("[advisories] unmaintained not supported"),
             "{notes}"
         );
     }
 
     #[test]
-    fn warn_levels_do_not_fail_and_a_file_without_rules_has_no_policy() {
+    fn licenses_include_dev_and_root_package_only() {
+        let (policy, _, _) =
+            translate("[licenses]\nallow = [\"MIT\"]\ninclude-dev = true\n").expect("valid");
+        let policy = policy.expect("policy");
+        assert!(!policy.licenses_exclude_dev);
+
+        let dir = std::env::temp_dir().join(format!("cargoscope-deny-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(
+            dir.join("deny.toml"),
+            "[bans]\nmultiple-versions = \"deny\"\n",
+        )
+        .expect("deny.toml");
+
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[workspace]\nmembers = [\"other\"]\n",
+        )
+        .expect("Cargo.toml");
+        let loaded = super::load(&dir)
+            .expect("load")
+            .expect("translation")
+            .policy
+            .expect("policy");
+        assert!(loaded.root_package_only);
+
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"a\"]\n")
+            .expect("virtual Cargo.toml");
+        let loaded = super::load(&dir)
+            .expect("load")
+            .expect("translation")
+            .policy
+            .expect("policy");
+        assert!(!loaded.root_package_only);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn warn_levels_and_build_scripts_translate_cleanly() {
+        use cargoscope_core::policy::LintLevel;
         let (policy, _, notes) = translate(
-            "[sources]\nunknown-registry = \"warn\"\n[bans]\nmultiple-versions = \"warn\"\n",
+            "[sources]\nunknown-registry = \"warn\"\nunknown-git = \"allow\"\n[bans]\nmultiple-versions = \"warn\"\n[bans.build]\nallow-build-scripts = [\"cc\", \"ring@0.17.8\"]\ninclude-workspace = true\nexecutables = \"deny\"\n",
         )
         .expect("valid");
         let policy = policy.expect("rules");
-        assert_eq!(policy.allow_registries, None);
-        assert!(!policy.deny_multiple_versions);
+        assert_eq!(policy.allow_registries, Some(vec!["crates.io".to_owned()]));
+        assert_eq!(policy.registry_source_level, LintLevel::Warn);
+        assert_eq!(policy.git_source_level, LintLevel::Allow);
+        assert_eq!(policy.multiple_versions, LintLevel::Warn);
+        assert!(policy.build_include_workspace);
+        assert_eq!(policy.allow_build_scripts.as_ref().map(Vec::len), Some(2));
         assert!(
-            notes
-                .iter()
-                .any(|note| note.contains("multiple-versions = \"warn\""))
+            !notes.iter().any(|note| note.contains("bans.build")),
+            "{notes:?}"
         );
+        let inspection = policy.build_inspection.as_ref().expect("[bans.build]");
+        assert_eq!(inspection.executables, LintLevel::Deny);
+        assert_eq!(inspection.interpreted, LintLevel::Allow);
+        let (bypass, _, _) = translate(
+            "[bans.build]\ninterpreted = \"warn\"\nscript-extensions = [\"sh\"]\nbypass = [{ crate = \"ring\", allow-globs = [\"tests/**\"], allow = [{ path = \"x.bin\", checksum = \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\" }] }]\n",
+        )
+        .expect("valid");
+        let inspection = bypass
+            .expect("rules")
+            .build_inspection
+            .expect("[bans.build]");
+        assert_eq!(inspection.interpreted, LintLevel::Warn);
+        assert_eq!(inspection.script_extensions, vec!["sh"]);
+        assert_eq!(inspection.bypass[0].name, "ring");
+        assert_eq!(inspection.bypass[0].allow_globs, vec!["tests/**"]);
+        assert_eq!(inspection.bypass[0].allow[0].0, "x.bin");
         let (none, ignores, _) =
             translate("[advisories]\nignore = [\"RUSTSEC-1\"]\n").expect("valid");
         assert!(none.is_none());

@@ -1,8 +1,10 @@
-//! Report rendering: text, JSON, SARIF and CycloneDX.
+//! Report rendering: text, JSON, SARIF, CycloneDX and HTML.
 
 pub mod compare;
 pub mod cyclonedx;
+pub mod html;
 pub mod sarif;
+mod terminal;
 
 use std::fmt::Write;
 use std::path::Path;
@@ -20,11 +22,17 @@ pub const JSON_FORMAT_VERSION: u32 = 1;
 pub struct TextOptions {
     /// Also list possibly-unused dependencies.
     pub show_uncertain: bool,
-    /// List every resolved package with its path, license and versions.
+    /// List every resolved package with its path, license and versions,
+    /// and every advisory in full instead of grouped by crate.
     pub verbose: bool,
+    /// Color the report with ANSI codes (a terminal without `NO_COLOR`).
+    pub color: bool,
+    /// End with the commands that act on the findings (`cargoscope fix`…),
+    /// which apply to a source project, not to a binary.
+    pub next_steps: bool,
 }
 
-fn scope(package: &Package) -> &'static str {
+pub(crate) fn scope(package: &Package) -> &'static str {
     if package.root {
         "root"
     } else if package.direct {
@@ -34,7 +42,7 @@ fn scope(package: &Package) -> &'static str {
     }
 }
 
-fn label(finding: &AdvisoryFinding) -> &str {
+pub(crate) fn label(finding: &AdvisoryFinding) -> &str {
     match (&finding.kind, finding.severity) {
         (AdvisoryKind::Informational(kind), _) => kind,
         (AdvisoryKind::Vulnerability, Some(severity)) => severity.as_str(),
@@ -42,7 +50,7 @@ fn label(finding: &AdvisoryFinding) -> &str {
     }
 }
 
-fn chain(inventory: &Inventory, index: usize) -> Option<String> {
+pub(crate) fn chain(inventory: &Inventory, index: usize) -> Option<String> {
     let path = inventory.path_to(index)?;
     let names: Vec<&str> = path
         .iter()
@@ -61,16 +69,24 @@ fn chain(inventory: &Inventory, index: usize) -> Option<String> {
 /// the full package list only with `verbose`; otherwise only counts are shown.
 pub fn render_text(project_root: &Path, report: &Report, options: TextOptions) -> String {
     let inventory = &report.inventory;
+    let paint = terminal::Paint::new(options.color);
+    let verbose = options.verbose;
     let mut out = String::new();
     // Writing to a String cannot fail.
-    let _ = writeln!(out, "CargoScope {VERSION}");
-    let _ = writeln!(out, "Target: {}", project_root.display());
-    let _ = writeln!(out, "Summary: {}", summary(report));
-
-    if report.checks.advisories {
-        render_advisories_text(&mut out, report);
+    if options.verbose {
+        let _ = writeln!(out, "CargoScope {VERSION}");
+        let _ = writeln!(out, "Target: {}", project_root.display());
+        let _ = writeln!(out, "Summary: {}", summary(report));
     } else {
-        out.push_str("\nAdvisories: not checked\n");
+        terminal::header(&mut out, project_root, report, paint);
+    }
+
+    if report.checks.advisories && options.verbose {
+        render_advisories_text(&mut out, report);
+    } else if report.checks.advisories {
+        terminal::advisories(&mut out, report, paint);
+    } else {
+        not_checked(&mut out, "Advisories", verbose);
     }
     if report.checks.unused {
         render_unused_text(
@@ -80,12 +96,12 @@ pub fn render_text(project_root: &Path, report: &Report, options: TextOptions) -
             report.unused_precise,
         );
     } else {
-        out.push_str("\nUnused dependencies: not checked\n");
+        not_checked(&mut out, "Unused dependencies", verbose);
     }
-    render_registry_text(&mut out, report);
-    render_duplicates_text(&mut out, report);
+    render_registry_text(&mut out, report, options.verbose);
+    render_duplicates_text(&mut out, report, verbose);
     render_weights_text(&mut out, report, options.verbose);
-    render_policy_text(&mut out, report);
+    render_policy_text(&mut out, report, options.verbose);
 
     if options.verbose {
         let _ = writeln!(out, "\nResolved packages: {}", inventory.packages.len());
@@ -101,8 +117,11 @@ pub fn render_text(project_root: &Path, report: &Report, options: TextOptions) -
     for warning in &report.warnings {
         let _ = writeln!(out, "\nwarning: {warning}");
     }
+    if options.next_steps {
+        terminal::next_steps(&mut out, report, verbose, paint);
+    }
 
-    out
+    terminal::style_sections(&out, paint)
 }
 
 /// One-line overview of the findings of the checks that ran.
@@ -167,9 +186,21 @@ pub fn summary(report: &Report) -> String {
             .count();
         parts.push(format!("{yanked} yanked"));
         parts.push(format!("{outdated_direct} outdated direct"));
+        let fragile = maintenance_rows(report).len();
+        if fragile > 0 {
+            parts.push(format!("{fragile} direct to watch"));
+        }
     }
     if let Some(violations) = &report.policy {
-        parts.push(plural(violations.len(), "policy violation"));
+        let errors = violations
+            .iter()
+            .filter(|v| v.level == cargoscope_core::policy::ViolationLevel::Error)
+            .count();
+        let warnings = violations.len() - errors;
+        parts.push(plural(errors, "policy violation"));
+        if warnings > 0 {
+            parts.push(plural(warnings, "policy warning"));
+        }
     }
     let duplicates = report.inventory.duplicates().len();
     if duplicates > 0 {
@@ -182,21 +213,58 @@ pub fn summary(report: &Report) -> String {
     parts.join(", ")
 }
 
-fn render_policy_text(out: &mut String, report: &Report) {
+/// How many of `len` rows the short report shows (all of them with `verbose`).
+fn shown_rows(len: usize, verbose: bool, short_limit: usize) -> usize {
+    if verbose { len } else { len.min(short_limit) }
+}
+
+/// The line that says how many rows the short report left out.
+fn more_rows(out: &mut String, len: usize, shown: usize) {
+    if shown < len {
+        let _ = writeln!(out, "  ... {} more (use --verbose)", len - shown);
+    }
+}
+
+/// A check that did not run: said only in the full report, since the short
+/// one lists only what was found.
+fn not_checked(out: &mut String, name: &str, verbose: bool) {
+    if verbose {
+        let _ = writeln!(out, "\n{name}: not checked");
+    }
+}
+
+fn render_policy_text(out: &mut String, report: &Report, verbose: bool) {
     if !report.checks.policy {
-        out.push_str("\nPolicy: not checked\n");
+        not_checked(out, "Policy", verbose);
         return;
     }
     let Some(violations) = &report.policy else {
         out.push_str("\nPolicy: no cargoscope.toml policy\n");
         return;
     };
-    let _ = writeln!(out, "\nPolicy violations: {}", violations.len());
-    for violation in violations {
-        let package = &report.inventory.packages[violation.package];
+    let errors = violations
+        .iter()
+        .filter(|v| v.level == cargoscope_core::policy::ViolationLevel::Error)
+        .count();
+    let warnings = violations.len() - errors;
+    if warnings == 0 {
+        let _ = writeln!(out, "\nPolicy violations: {errors}");
+    } else {
+        let suffix = if warnings == 1 { "" } else { "s" };
         let _ = writeln!(
             out,
-            "- [{}] {} {}: {}",
+            "\nPolicy violations: {errors} ({warnings} warning{suffix})"
+        );
+    }
+    for violation in violations {
+        let package = &report.inventory.packages[violation.package];
+        let tag = match violation.level {
+            cargoscope_core::policy::ViolationLevel::Error => "",
+            cargoscope_core::policy::ViolationLevel::Warning => " [warning]",
+        };
+        let _ = writeln!(
+            out,
+            "- [{}]{tag} {} {}: {}",
             violation.rule.as_str(),
             package.name,
             package.version,
@@ -267,10 +335,8 @@ fn render_inventory_text(out: &mut String, report: &Report) {
             if info.yanked == Some(true) {
                 out.push_str(" YANKED");
             }
-            if info.outdated
-                && let Some(latest) = &info.latest_version
-            {
-                let _ = write!(out, " -> {latest} available");
+            if let Some(targets) = format_outdated_targets(&package.version, info) {
+                let _ = write!(out, " -> {targets} available");
             }
         }
         out.push('\n');
@@ -349,7 +415,7 @@ fn render_unused_text(
 
 /// `" (dev)"`, `" (build)"` or `" (dev, build)"` when the project declares
 /// the direct dependency `name` only in those sections; empty otherwise.
-fn kind_note(report: &Report, name: &str) -> &'static str {
+pub(crate) fn kind_note(report: &Report, name: &str) -> &'static str {
     let Some(kinds) = report.direct_kinds.get(name) else {
         return "";
     };
@@ -364,7 +430,7 @@ fn kind_note(report: &Report, name: &str) -> &'static str {
 }
 
 /// Section names under which the project declares `name` directly.
-fn kind_names(report: &Report, name: &str) -> Vec<String> {
+pub(crate) fn kind_names(report: &Report, name: &str) -> Vec<String> {
     report
         .direct_kinds
         .get(name)
@@ -384,7 +450,7 @@ fn kind_names(report: &Report, name: &str) -> Vec<String> {
 /// Crates resolved in several versions: every version but the newest shows
 /// the chain that pulls it in, since that is what keeps it in the build,
 /// labelled when the chain starts with a dev- or build-dependency.
-fn render_duplicates_text(out: &mut String, report: &Report) {
+fn render_duplicates_text(out: &mut String, report: &Report, verbose: bool) {
     let inventory = &report.inventory;
     let duplicates = inventory.duplicates();
     if duplicates.is_empty() {
@@ -395,7 +461,8 @@ fn render_duplicates_text(out: &mut String, report: &Report) {
         "\nCrates in several versions: {} (each version is compiled separately)",
         duplicates.len()
     );
-    for (name, indices) in &duplicates {
+    let shown = shown_rows(duplicates.len(), verbose, 5);
+    for (name, indices) in duplicates.iter().take(shown) {
         let versions: Vec<&str> = indices
             .iter()
             .map(|&index| inventory.packages[index].version.as_str())
@@ -417,12 +484,11 @@ fn render_duplicates_text(out: &mut String, report: &Report) {
             }
         }
     }
+    more_rows(out, duplicates.len(), shown);
 }
 
-/// Direct dependencies that pull in packages nothing else needs, heaviest
-/// first, the ones that ship with the project (normal dependencies) before
-/// dev- and build-only ones: the ten first, or all of them with `verbose`.
-fn render_weights_text(out: &mut String, report: &Report, verbose: bool) {
+/// Direct dependencies with `exclusive > 1`, normal dependencies first.
+pub(crate) fn sorted_heavy_weights(report: &Report) -> Vec<(usize, usize, usize)> {
     let inventory = &report.inventory;
     let mut heavy: Vec<(usize, usize, usize)> = inventory
         .direct_weights()
@@ -432,6 +498,15 @@ fn render_weights_text(out: &mut String, report: &Report, verbose: bool) {
     heavy.sort_by_key(|&(index, _, _)| {
         !kind_note(report, &inventory.packages[index].name).is_empty()
     });
+    heavy
+}
+
+/// Direct dependencies that pull in packages nothing else needs, heaviest
+/// first, the ones that ship with the project (normal dependencies) before
+/// dev- and build-only ones: the five first, or all of them with `verbose`.
+fn render_weights_text(out: &mut String, report: &Report, verbose: bool) {
+    let inventory = &report.inventory;
+    let heavy = sorted_heavy_weights(report);
     if heavy.is_empty() {
         return;
     }
@@ -439,11 +514,7 @@ fn render_weights_text(out: &mut String, report: &Report, verbose: bool) {
         out,
         "\nHeaviest direct dependencies: packages that would leave the tree without each one"
     );
-    let shown = if verbose {
-        heavy.len()
-    } else {
-        heavy.len().min(10)
-    };
+    let shown = shown_rows(heavy.len(), verbose, 5);
     for &(index, exclusive, tree) in &heavy[..shown] {
         let package = &inventory.packages[index];
         let _ = writeln!(
@@ -454,14 +525,11 @@ fn render_weights_text(out: &mut String, report: &Report, verbose: bool) {
             kind_note(report, &package.name)
         );
     }
-    if shown < heavy.len() {
-        let _ = writeln!(out, "  ... {} more (use --verbose)", heavy.len() - shown);
-    }
+    more_rows(out, heavy.len(), shown);
 }
 
-fn render_registry_text(out: &mut String, report: &Report) {
-    let date = report.registry_date.as_deref().unwrap_or("never");
-    let registry_packages: Vec<(usize, &cargoscope_core::PackageInfo)> = report
+pub(crate) fn registry_packages(report: &Report) -> Vec<(usize, &cargoscope_core::PackageInfo)> {
+    report
         .package_info
         .iter()
         .enumerate()
@@ -473,31 +541,152 @@ fn render_registry_text(out: &mut String, report: &Report) {
                     source.starts_with("registry+") || source.starts_with("sparse+")
                 })
         })
-        .collect();
+        .collect()
+}
+
+fn render_registry_text(out: &mut String, report: &Report, verbose: bool) {
+    let date = report.registry_date.as_deref().unwrap_or("never");
+    let registry_packages = registry_packages(report);
 
     if report.checks.licenses {
-        render_licenses_text(out, &registry_packages, date);
+        render_licenses_text(out, &registry_packages, date, verbose);
     } else {
-        out.push_str("\nLicenses: not checked\n");
+        not_checked(out, "Licenses", verbose);
     }
     if report.checks.versions {
-        render_versions_text(out, report, &registry_packages);
+        render_versions_text(out, report, &registry_packages, verbose);
+        render_maintenance_text(out, report, verbose);
     } else {
-        out.push_str("\nVersions: not checked\n");
+        not_checked(out, "Versions", verbose);
     }
 }
 
-type RegistryPackages<'a> = [(usize, &'a cargoscope_core::PackageInfo)];
+/// Direct crates.io dependencies with maintenance concerns, in package order.
+pub(crate) fn maintenance_rows(
+    report: &Report,
+) -> Vec<(usize, Vec<cargoscope_core::MaintenanceConcern>)> {
+    registry_packages(report)
+        .into_iter()
+        .filter(|(index, _)| {
+            let package = &report.inventory.packages[*index];
+            package.direct && !package.root
+        })
+        .map(|(index, info)| (index, info.maintenance_concerns()))
+        .filter(|(_, concerns)| !concerns.is_empty())
+        .collect()
+}
 
-fn render_licenses_text(out: &mut String, registry_packages: &RegistryPackages<'_>, date: &str) {
-    let mut licenses: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+/// One concern in words, with its evidence.
+pub(crate) fn describe_concern(
+    concern: cargoscope_core::MaintenanceConcern,
+    info: &cargoscope_core::PackageInfo,
+) -> String {
+    use cargoscope_core::MaintenanceConcern;
+    match concern {
+        MaintenanceConcern::Archived => format!(
+            "repository archived ({})",
+            info.repository.as_deref().unwrap_or("?")
+        ),
+        MaintenanceConcern::Stale => format!(
+            "no release since {}",
+            info.last_release.as_deref().unwrap_or("?")
+        ),
+        MaintenanceConcern::SingleOwner => format!(
+            "single owner ({})",
+            info.owners
+                .as_ref()
+                .and_then(|owners| owners.first())
+                .map_or("?", String::as_str)
+        ),
+    }
+}
+
+fn render_maintenance_text(out: &mut String, report: &Report, verbose: bool) {
+    let direct: Vec<&cargoscope_core::PackageInfo> = registry_packages(report)
+        .into_iter()
+        .filter(|(index, _)| {
+            let package = &report.inventory.packages[*index];
+            package.direct && !package.root
+        })
+        .map(|(_, info)| info)
+        .collect();
+    if direct.is_empty() {
+        return;
+    }
+    let rows = maintenance_rows(report);
+    let _ = writeln!(
+        out,
+        "\nMaintenance: {} of {} direct dependencies to watch",
+        rows.len(),
+        direct.len()
+    );
+    let shown = shown_rows(rows.len(), verbose, 8);
+    for (index, concerns) in rows.iter().take(shown) {
+        let package = &report.inventory.packages[*index];
+        let info = &report.package_info[*index];
+        let reasons: Vec<String> = concerns
+            .iter()
+            .map(|&concern| describe_concern(concern, info))
+            .collect();
+        let _ = writeln!(
+            out,
+            "- {} {}: {}",
+            package.name,
+            package.version,
+            reasons.join("; ")
+        );
+    }
+    more_rows(out, rows.len(), shown);
+    if direct.iter().all(|info| info.owners.is_none()) {
+        out.push_str("  (owners and archived status not downloaded: run `cargoscope update`)\n");
+    }
+}
+
+pub(crate) type RegistryPackages<'a> = [(usize, &'a cargoscope_core::PackageInfo)];
+
+pub(crate) fn sorted_license_counts<'a>(
+    registry_packages: &'a RegistryPackages<'a>,
+) -> Vec<(&'a str, usize)> {
+    let mut licenses: std::collections::BTreeMap<&'a str, usize> =
+        std::collections::BTreeMap::new();
     for (_, info) in registry_packages {
         *licenses
             .entry(info.license.as_deref().unwrap_or("unknown"))
             .or_default() += 1;
     }
-    let mut by_count: Vec<(&str, usize)> = licenses.into_iter().collect();
+    let mut by_count: Vec<(&'a str, usize)> = licenses.into_iter().collect();
     by_count.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(right.0)));
+    by_count
+}
+
+fn render_licenses_text(
+    out: &mut String,
+    registry_packages: &RegistryPackages<'_>,
+    date: &str,
+    verbose: bool,
+) {
+    let by_count = sorted_license_counts(registry_packages);
+    if !verbose {
+        // One line: the most common expressions, and the unknown ones.
+        let top: Vec<String> = by_count
+            .iter()
+            .filter(|(license, _)| *license != "unknown")
+            .take(3)
+            .map(|(license, count)| format!("{license} {count}"))
+            .collect();
+        let unknown = by_count
+            .iter()
+            .find(|(license, _)| *license == "unknown")
+            .map_or(String::new(), |(_, count)| format!(", {count} unknown"));
+        let _ = writeln!(
+            out,
+            "\nLicenses: {} registry packages, {} ({}){unknown}",
+            registry_packages.len(),
+            terminal::plural(by_count.len(), "license expression"),
+            top.join(", ")
+        );
+        return;
+    }
     let _ = writeln!(
         out,
         "\nLicenses of {} registry packages (crates.io data downloaded {date}):",
@@ -508,10 +697,33 @@ fn render_licenses_text(out: &mut String, registry_packages: &RegistryPackages<'
     }
 }
 
+pub(crate) fn format_outdated_targets(
+    current_version: &str,
+    info: &cargoscope_core::PackageInfo,
+) -> Option<String> {
+    if !info.outdated {
+        return None;
+    }
+    let latest = info.latest_version.as_deref().unwrap_or("?");
+    match info.outdated_kind(current_version) {
+        cargoscope_core::OutdatedKind::None => Some(latest.to_owned()),
+        cargoscope_core::OutdatedKind::Compatible => {
+            let compat = info.compatible_upgrade(current_version).unwrap_or(latest);
+            Some(format!("{compat} (compatible)"))
+        }
+        cargoscope_core::OutdatedKind::Breaking => Some(format!("{latest} (breaking)")),
+        cargoscope_core::OutdatedKind::Both => {
+            let compat = info.compatible_upgrade(current_version).unwrap_or(latest);
+            Some(format!("{compat} (compatible), {latest} (breaking)"))
+        }
+    }
+}
+
 fn render_versions_text(
     out: &mut String,
     report: &Report,
     registry_packages: &RegistryPackages<'_>,
+    verbose: bool,
 ) {
     let yanked: Vec<usize> = registry_packages
         .iter()
@@ -520,13 +732,15 @@ fn render_versions_text(
         .collect();
     if !yanked.is_empty() {
         let _ = writeln!(out, "\nYanked versions in use: {}", yanked.len());
-        for index in yanked {
+        let shown = shown_rows(yanked.len(), verbose, 5);
+        for &index in yanked.iter().take(shown) {
             let package = &report.inventory.packages[index];
             let _ = writeln!(out, "- {} {}", package.name, package.version);
             if let Some(chain) = chain(&report.inventory, index) {
                 let _ = writeln!(out, "    via {chain}");
             }
         }
+        more_rows(out, yanked.len(), shown);
     }
 
     let outdated = registry_packages
@@ -543,21 +757,23 @@ fn render_versions_text(
         "\nOutdated packages: {outdated} ({} direct)",
         direct_outdated.len()
     );
-    for (index, info) in direct_outdated {
+    let shown = shown_rows(direct_outdated.len(), verbose, 8);
+    for &(index, info) in direct_outdated.iter().take(shown) {
         let package = &report.inventory.packages[index];
         let published = info
             .latest_published
             .as_deref()
             .map(|date| format!(", published {date}"))
             .unwrap_or_default();
+        let targets = format_outdated_targets(&package.version, info)
+            .unwrap_or_else(|| info.latest_version.as_deref().unwrap_or("?").to_owned());
         let _ = writeln!(
             out,
-            "- {} {} -> {}{published}",
-            package.name,
-            package.version,
-            info.latest_version.as_deref().unwrap_or("?")
+            "- {} {} -> {targets}{published}",
+            package.name, package.version,
         );
     }
+    more_rows(out, direct_outdated.len(), shown);
 }
 
 /// Renders a versioned JSON report, terminated by a newline.
@@ -646,15 +862,33 @@ pub fn render_json(project_root: &Path, report: &Report) -> String {
         );
         write_path(&mut out, inventory, index);
         let info = report.package_info.get(index).cloned().unwrap_or_default();
+        let outdated_kind = info.outdated_kind(&package.version);
         let _ = write!(
             out,
-            ",\"license\":{},\"latest_version\":{},\"latest_published\":{},\"outdated\":{},\"yanked\":{}}}",
+            ",\"license\":{},\"latest_version\":{},\"latest_published\":{},\"latest_compatible\":{},\"compatible_published\":{},\"outdated\":{},\"outdated_kind\":\"{}\",\"yanked\":{},\"last_release\":{},\"owners\":{},\"repository\":{},\"archived\":{},\"maintenance\":{}}}",
             json_string_or_null(info.license.as_deref()),
             json_string_or_null(info.latest_version.as_deref()),
             json_string_or_null(info.latest_published.as_deref()),
+            json_string_or_null(info.latest_compatible.as_deref()),
+            json_string_or_null(info.compatible_published.as_deref()),
             info.outdated,
+            outdated_kind.as_str(),
             info.yanked
                 .map_or("null", |yanked| if yanked { "true" } else { "false" }),
+            json_string_or_null(info.last_release.as_deref()),
+            info.owners
+                .as_deref()
+                .map_or_else(|| "null".to_owned(), json_string_array),
+            json_string_or_null(info.repository.as_deref()),
+            info.archived
+                .map_or("null", |archived| if archived { "true" } else { "false" }),
+            json_string_array(
+                &info
+                    .maintenance_concerns()
+                    .into_iter()
+                    .map(|concern| concern.as_str().to_owned())
+                    .collect::<Vec<_>>()
+            ),
         );
     }
     out.push_str("],");
@@ -705,8 +939,9 @@ pub fn render_json(project_root: &Path, report: &Report) -> String {
                 let package = &inventory.packages[violation.package];
                 let _ = write!(
                     out,
-                    "{{\"rule\":\"{}\",\"package\":{{\"name\":\"{}\",\"version\":\"{}\"}},\"message\":\"{}\",\"path\":",
+                    "{{\"rule\":\"{}\",\"level\":\"{}\",\"package\":{{\"name\":\"{}\",\"version\":\"{}\"}},\"message\":\"{}\",\"path\":",
                     violation.rule.as_str(),
+                    violation.level.as_str(),
                     json_escape(&package.name),
                     json_escape(&package.version),
                     json_escape(&violation.message)
@@ -809,6 +1044,8 @@ mod tests {
     const VERBOSE: TextOptions = TextOptions {
         show_uncertain: false,
         verbose: true,
+        color: false,
+        next_steps: true,
     };
     use cargoscope_core::{
         AdvisoryFinding, AdvisoryKind, Checks, DependencyKind, Inventory, Package, PackageInfo,
@@ -931,7 +1168,7 @@ mod tests {
             version: "2.0.0".to_owned(),
             ..package("beta", None, false, true, vec![])
         });
-        let text = render_text(Path::new("."), &report, TextOptions::default());
+        let text = render_text(Path::new("."), &report, VERBOSE);
         assert!(
             text.contains("1 crate in several versions, 5 packages"),
             "{text}"
@@ -1017,7 +1254,7 @@ mod tests {
             "{\"id\":\"TEST-0001\",\"aliases\":[\"CVE-TEST\"],\"title\":\"Beta is broken\",\"date\":\"2025-05-05\",\"url\":\"https://example.test/report\",\"kind\":\"vulnerability\",\"informational\":null,\"severity\":\"high\",\"package\":{\"name\":\"beta\",\"version\":\"1.0.0\"},\"patched\":[\">= 1.2.0\"],\"path\":[{\"name\":\"app\",\"version\":\"1.0.0\"},{\"name\":\"alpha\",\"version\":\"1.0.0\"},{\"name\":\"beta\",\"version\":\"1.0.0\"}],\"ignored_reason\":null}"
         ));
         assert!(json.contains(
-            "{\"name\":\"orphan\",\"version\":\"1.0.0\",\"scope\":\"transitive\",\"direct\":false,\"source\":null,\"path\":null,\"license\":null,\"latest_version\":null,\"latest_published\":null,\"outdated\":false,\"yanked\":null}"
+            "{\"name\":\"orphan\",\"version\":\"1.0.0\",\"scope\":\"transitive\",\"direct\":false,\"source\":null,\"path\":null,\"license\":null,\"latest_version\":null,\"latest_published\":null,\"latest_compatible\":null,\"compatible_published\":null,\"outdated\":false,\"outdated_kind\":\"none\",\"yanked\":null,\"last_release\":null,\"owners\":null,\"repository\":null,\"archived\":null,\"maintenance\":[]}"
         ));
         assert!(json.ends_with("\"unused\":[],\"warnings\":[]}\n"));
     }
@@ -1091,6 +1328,8 @@ mod tests {
             TextOptions {
                 show_uncertain: true,
                 verbose: true,
+                color: false,
+                next_steps: true,
             },
         );
         assert!(text.contains("- openssl-sys [possibly-unused] in [dependencies] of Cargo.toml\n"));
@@ -1115,8 +1354,11 @@ mod tests {
                 license: Some("MIT".to_owned()),
                 latest_version: Some("2.0.0".to_owned()),
                 latest_published: Some("2026-01-01".to_owned()),
+                latest_compatible: Some("1.4.0".to_owned()),
+                compatible_published: Some("2025-11-10".to_owned()),
                 yanked: Some(true),
                 outdated: true,
+                ..PackageInfo::default()
             },
             PackageInfo::default(),
             PackageInfo::default(),
@@ -1127,10 +1369,10 @@ mod tests {
         ));
         assert!(text.contains("Yanked versions in use: 1\n- alpha 1.0.0\n    via app -> alpha\n"));
         assert!(text.contains(
-            "Outdated packages: 1 (1 direct)\n- alpha 1.0.0 -> 2.0.0, published 2026-01-01\n"
+            "Outdated packages: 1 (1 direct)\n- alpha 1.0.0 -> 1.4.0 (compatible), 2.0.0 (breaking), published 2026-01-01\n"
         ));
         assert!(text.contains(
-            "- alpha 1.0.0 [direct] (registry+https://example.test) MIT YANKED -> 2.0.0 available\n"
+            "- alpha 1.0.0 [direct] (registry+https://example.test) MIT YANKED -> 1.4.0 (compatible), 2.0.0 (breaking) available\n"
         ));
 
         let json = render_json(Path::new("."), &report);
@@ -1139,7 +1381,7 @@ mod tests {
                 "\"registry\":{\"source\":\"crates.io\",\"downloaded_on\":\"2026-02-03\"}"
             )
         );
-        assert!(json.contains("\"license\":\"MIT\",\"latest_version\":\"2.0.0\",\"latest_published\":\"2026-01-01\",\"outdated\":true,\"yanked\":true}"));
+        assert!(json.contains("\"license\":\"MIT\",\"latest_version\":\"2.0.0\",\"latest_published\":\"2026-01-01\",\"latest_compatible\":\"1.4.0\",\"compatible_published\":\"2025-11-10\",\"outdated\":true,\"outdated_kind\":\"both\",\"yanked\":true,\"last_release\":null,\"owners\":null,\"repository\":null,\"archived\":null,\"maintenance\":[]}"));
     }
 
     #[test]

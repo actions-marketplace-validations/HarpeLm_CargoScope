@@ -1,13 +1,18 @@
 # Reading deny.toml: CargoScope against cargo-deny (2026-11-15)
 
-28 repositories of the corpora have their own cargo-deny configuration (`deny.toml`, `.deny.toml`). For each, `cargo deny check licenses bans sources` (cargo-deny 0.20.2) and `cargoscope scan --checks inventory,licenses,policy` (no `cargoscope.toml`, so CargoScope reads the same `deny.toml`) were run on the same commit, and their errors compared by rule and crate.
+28 repositories of the first two corpora (`corpus.toml` and `compiler-judge`, excluding one pre-0.14 config rejected by cargo-deny 0.20.2) have their own cargo-deny configuration (`deny.toml`, `.deny.toml`). Including `blind-judge` brings the total to 36 repositories, 34 of which are accepted by cargo-deny 0.20.2. For each, `cargo deny check licenses bans sources` (cargo-deny 0.20.2) and `cargoscope scan --checks inventory,licenses,policy` (no `cargoscope.toml`, so CargoScope reads the same `deny.toml`) were run on the same commit, and their errors compared by rule and crate.
 
 | | Crates reported by both | By cargo-deny only | By CargoScope only |
 |---|---|---|---|
-| First translation (commit `22495c9`) | 3 | 9 | 104 |
-| After the fixes below (commit `834f525`) | 3 | 9 | 6 |
+| First translation (28 repos, commit `22495c9`) | 3 | 9 | 104 |
+| After the `834f525` fixes (28 repos) | 3 | 9 | 6 |
+| After P4 fixes (same 28 repos) | 3 | 9 | 0 |
+| **After Option A fixes (`[bans] build`, hashes, `"warn"`, same 28 repos)** | **12** | **0** | **0** |
+| Expanded corpora with `blind-judge` after P4 (34 valid repos) | 10 | 22 | 0 |
+| Expanded corpora with `blind-judge` after Option A (34 valid repos) | 31 | 1 | 2 |
+| **Expanded corpora with `blind-judge` after graph fixes (34 valid repos)** | **32** | **0** | **0** |
 
-**22 of the 28 repositories give exactly the same result** (no error from either tool).
+**28 of the original 28 repositories (100%) give the same error set**, and the last two graph discrepancies across the **34 valid repositories** (`tower-rs/tower-http` and `taiki-e/portable-atomic`) are now resolved (both verified directly against `cargo-deny 0.20.2`).
 
 The fixes the comparison led to:
 
@@ -16,9 +21,53 @@ The fixes the comparison led to:
 - `wrappers` of a ban, `skip-tree`, `exclude-unpublished` and cargo-deny's default `multiple-versions-include-dev = false` (duplicates pulled in only by dev-dependencies do not count) were added.
 - A license with `+` ("or later", as `MPL-2.0+` in cargo's `im-rc`) was refused when its version is allowed. This also fixes `cargoscope.toml`.
 
-What remains:
+Root-cause fixes implemented on `main` (`0.6.0-dev`) and verified in the re-run above (eliminating all 6 crates previously reported only by CargoScope):
 
-- **9 crates found by cargo-deny only**, all in pin-project-lite: its `[bans] build` rule (allowed build scripts). CargoScope has no such rule and says so in a note.
-- **6 crates found by CargoScope only**, all reached only through internal workspace members or test harnesses (`compile_fail_utils` in bevy, `resolver-tests` in cargo, `limbo-harness-support` in rustls-webpki, ring's wasm test dependencies) or an Android-only path (`jni-sys` in wgpu). cargo-deny leaves them out for a reason not found yet; CargoScope is stricter there.
+- `[licenses] include-dev` in `deny.toml` now defaults to `false`, leaving dev-only dependencies out of license checks unless `include-dev = true` (such as `limbo-harness-support` in `rustls-webpki`, a `[dev-dependencies]` crate pulling non-allowed transitive licenses).
+- When `Cargo.toml` defines a root `[package]`, reading `deny.toml` now roots `cargo tree` at that root package instead of adding `--workspace` (matching cargo-deny/`krates` for non-virtual root manifests such as `bevy`, `cargo`, `rustls-webpki`, and `ring`, keeping internal workspace test members out of the checked graph).
+- `multiple-versions` ignores `semver-trick` self-dependencies (cases where all direct parents of a duplicate have the same crate name).
+- `[bans] features` (`allow`, `deny`, `exact`) is now supported and translated from `deny.toml`.
 
-Every setting CargoScope cannot translate is listed in the report's warnings (for example `confidence-threshold`, `private`, `[bans] build`, `features`, `unused-allowed-license`).
+- `[bans] build` (`allow-build-scripts` and `include-workspace`), `[licenses.clarify]` `license-files` 32-bit `xxHash32` verification, and `"warn"` lint levels (`[bans] multiple-versions = "warn"`, `[sources] unknown-registry` / `unknown-git = "warn"`) were added: all **21 `[bans] build` errors** across `taiki-e/pin-project` (7), `taiki-e/pin-project-lite` (9), and `taiki-e/portable-atomic` (5) now match `cargo-deny`.
+
+- **1 license error** in `tower-rs/tower-http` (`zstd-sys`, `BSD-3-Clause AND BSD-2-Clause`), fixed on `0.6.0-dev`: `active_packages` now runs `cargo tree --prefix depth` without `--exclude` and prunes `exclude-unpublished` workspace members afterward, preserving workspace feature unification from `examples/*` onto `tower-http` (`full` -> `zstd-sys`) before excluding example-only dependencies (`cargo deny` 1 error == CargoScope 1 error).
+- **2 build-script errors** (`proc-macro2`, `quote`) in `taiki-e/portable-atomic`, fixed on `0.6.0-dev`: `serde_core` declares `serde_derive` under `[target."cfg(any())".dependencies]`, which `cargo tree --target all` retains. CargoScope now reads `cargo metadata` `resolve.nodes` `dep_kinds` when `targets` is empty and prunes edges whose matching `dep_kinds` are all unsatisfiable (`cfg(any())` / `cfg(not(all()))`), matching `cargo-deny`'s 10 errors (`5` `[bans.build]` + `5` `[sources]`).
+
+(Two older `deny.toml` files in `briansmith/untrusted` and `polyfill-rs/is_terminal_polyfill` use pre-0.14 `[advisories]` syntax rejected by cargo-deny 0.20.2 and were excluded from the comparison.)
+
+Every remaining unsupported setting is listed in the report's warnings (for example `[bans.build] executables`/`interpreted`/`bypass`).
+
+## License parity re-run (2026-11-16, commit `c487dc1`)
+
+The license check now gathers licenses as cargo-deny does: license texts recognised from `LICENSE*`/`COPYING*` files with `confidence-threshold` (same `spdx` license store and settings as cargo-deny 0.20), the project's own packages, `[licenses.private]`, `unused-allowed-license` and an empty `allow` list. Both tools were re-run on the 28 local repositories (cargo-deny 0.20.2 freshly; the 6 `blind-judge` repositories ran on GitHub Actions and were not re-run).
+
+| | Both | cargo-deny only | CargoScope only |
+|---|---|---|---|
+| Errors, all rules (28 repos) | 12 | 0 | 0 |
+| License errors | 0 | 0 | 0 |
+| `unused-allowed-license` warnings (`license-not-encountered`) | 67 | 0 | 3 |
+
+- **License errors match exactly**, but none of these 28 projects has one: the parity is real, the evidence thin.
+- The 67 shared warnings check the new lint. The 3 extra ones (`ISC`, `CDLA-Permissive-2.0` in `actix-web`, `Unicode-3.0` in `clap`) come from a graph difference: cargo-deny takes features as `cargo metadata` unifies them, including features that only dev-dependencies enable (`rustls` in actix-web), while `cargo tree -e normal,build` leaves them out.
+- `wgpu` had 2 extra duplicate errors (`petgraph`, `fixedbitset`): the unpublished `wgpu-test` member enables `parking_lot/deadlock_detection`, which pulls in `petgraph` 0.6. cargo-deny (krates) gives the kept members the features the whole workspace unifies on them, but does not apply what only excluded members ask of other crates. CargoScope now does the same with a second `cargo tree` rooted at the published members with exactly those features: `wgpu` matches, and `tower-http` keeps its `zstd-sys` license error (cargo-deny reports it too).
+- The re-run found two bugs, now fixed: a loop between path dependencies that point at each other made scans of `axum`, `bevy`, `diesel` and `tower` run for more than 10 minutes (1 s now), and with a root `[package]`, the other `default-members` were checked (`ring-cavp` in ring).
+
+
+## Executables and scripts in build-time crates (2026-11-16, commit `7401522`)
+
+`[bans.build]` now inspects the files of the crates that run code at build time (build scripts, proc-macros), as cargo-deny 0.20.2 does: native executables (ELF, PE, Mach-O, archives with `include-archives`), `#!` scripts (`interpreted`), `script-extensions` and the built-in globs, `bypass` (paths with SHA-256, `allow-globs`, build-script checksums with `required-features`).
+
+- On the 28 repositories with their own `deny.toml`, errors stay identical (12 shared, 0 on either side only). Only 2 of them have a `[bans.build]` table, and cargo-deny finds no executable there: the evidence is thin, so a stress test followed.
+- **Stress test:** in 6 repositories, `[bans.build]` was temporarily set to `executables = "deny"`, `interpreted = "deny"`, `enable-builtin-globs = true`, `include-dependencies = true`, `include-archives = true`, then both tools were run (`cargo deny check bans` and `cargoscope scan`), and the reported files compared by crate and path.
+
+| Repository | Files reported by both | cargo-deny only | CargoScope only |
+|---|---|---|---|
+| `briansmith/ring` | 7 | 0 | 0 |
+| `clap-rs/clap` | 8 | 0 | 0 |
+| `gfx-rs/wgpu` | 18 | 0 | 0 |
+| `tokio-rs/axum` | 32 | 0 | 0 |
+| `diesel-rs/diesel` | 358 | 0 | 0 |
+| `actix/actix-web` (without `include-dependencies`, see below) | 2,929 | 0 | 0 |
+| **Total** | **3,352** | **0** | **0** |
+
+With `include-dependencies = true`, cargo-deny 0.20.2 crashes on `actix-web` (stack overflow in its recursive dependency walk); CargoScope completes. The run without that setting is the one compared.

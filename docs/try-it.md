@@ -2,7 +2,7 @@
 
 CargoScope reads your `Cargo.lock` and `Cargo.toml` files and tells you, in one report, which dependencies have known advisories, which look unused, which are yanked or outdated, and why each one is in your project. It never runs your code, and modifies your files only if you ask (`cargoscope fix --apply`).
 
-This is version `0.5.1`, and it is young: your feedback decides what comes next. See the end of this page.
+This is version `0.6.0`, and it is young: your feedback decides what comes next. See the end of this page.
 
 ## 1. Install (about 10 seconds)
 
@@ -40,7 +40,7 @@ The first line is a summary. Below it:
 
 - **Advisories**: known RustSec advisories, with the chain that pulls the crate in and the version that fixes it.
 - **Likely-unused dependencies**: declared dependencies with no use found in your code, with the evidence. These are candidates to check, not orders to delete.
-- **Licenses**, **yanked versions in use**, **outdated direct dependencies**.
+- **Licenses**, **yanked versions in use**, **outdated direct dependencies** (labelled `(compatible)` for non-breaking updates vs `(breaking)`).
 
 By default, a security vulnerability makes the command exit with code 1, as cargo-audit does. Add `--fail-on none` to only report.
 
@@ -48,9 +48,12 @@ By default, a security vulnerability makes the command exit with code 1, as carg
 
 ```sh
 cargoscope scan . --show-uncertain     # also list dependencies that are only possibly unused, with the reason
-cargoscope scan . --verbose            # list every resolved package with its dependency chain
+cargoscope scan . --verbose            # full report: every advisory and resolved package with its chain
 cargoscope scan . --format json        # machine-readable report
-cargoscope scan . --format sarif --output results.sarif   # for GitHub code scanning
+cargoscope scan . --format sarif --output results.sarif          # for GitHub code scanning
+cargoscope scan . --format cyclonedx --output sbom.cdx.json      # CycloneDX 1.5 SBOM (on main / 0.6)
+cargoscope scan . --format html --output report.html             # standalone offline HTML report (on main / 0.6)
+cargoscope why serde                   # reverse dependency chains and pruning weight for a crate (on main / 0.6)
 cargoscope scan . --precise            # confirm unused dependencies with rustc (compiles your project)
 cargoscope fix .                       # show which unused dependencies would be removed
 cargoscope fix . --apply               # remove them from Cargo.toml (formatting and comments kept)

@@ -10,13 +10,17 @@ use std::path::Path;
 use cargoscope_core::{Inventory, Package, UnusedFinding};
 
 pub mod binary;
+pub mod build_inspect;
 pub mod config;
+pub mod crate_sources;
 pub mod deny;
 pub mod fix;
+pub mod licenses;
 pub mod locations;
 pub mod precise;
 pub mod targets;
 pub mod unused;
+pub mod updates;
 pub mod workspace;
 
 /// An error while reading or interpreting a Cargo project.

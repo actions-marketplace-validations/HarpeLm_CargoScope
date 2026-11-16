@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use cargoscope_advisory::AdvisoryDatabase;
 use cargoscope_advisory::crates_io::{self, RegistryCache};
-use cargoscope_core::policy::{Policy, Violation};
+use cargoscope_core::policy::{GraphContext, LintLevel, Policy, Violation, ViolationLevel};
 use cargoscope_core::{AdvisoryFinding, Checks, Inventory, PackageInfo, Report};
 use cargoscope_report::sarif::SarifLocations;
 
@@ -19,6 +19,7 @@ pub enum OutputFormat {
     Json,
     Sarif,
     CycloneDx,
+    Html,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -32,6 +33,42 @@ pub struct ScanOptions {
     pub checks: Checks,
     pub baseline: Option<PathBuf>,
     pub precise: bool,
+    pub color: ColorChoice,
+}
+
+/// When the text report uses colors (`--color`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorChoice {
+    Auto,
+    Always,
+    Never,
+}
+
+impl ColorChoice {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "always" => Ok(Self::Always),
+            "never" => Ok(Self::Never),
+            other => Err(format!(
+                "Unknown color choice: {other}. Use auto, always or never."
+            )),
+        }
+    }
+
+    /// Colors for `auto` only on a terminal, without `NO_COLOR`, and not into a file.
+    pub(crate) fn enabled(self, writes_to_file: bool) -> bool {
+        use std::io::IsTerminal;
+        match self {
+            Self::Always => true,
+            Self::Never => false,
+            Self::Auto => {
+                !writes_to_file
+                    && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
+                    && std::io::stdout().is_terminal()
+            }
+        }
+    }
 }
 
 pub fn parse_scan_options(
@@ -47,6 +84,7 @@ pub fn parse_scan_options(
         checks: Checks::ALL,
         baseline: None,
         precise: false,
+        color: ColorChoice::Auto,
     };
     let mut path_given = false;
 
@@ -75,6 +113,7 @@ pub fn parse_scan_options(
                     )
                 })?;
             }
+            "--color" => options.color = ColorChoice::parse(&value()?)?,
             "--fail-on" => options.fail_on = parse_fail_on(&value()?)?,
             "--show-uncertain" if inline_value.is_none() => options.show_uncertain = true,
             "--verbose" | "-v" if inline_value.is_none() => options.verbose = true,
@@ -96,8 +135,9 @@ fn parse_output_format(value: &str) -> Result<OutputFormat, String> {
         "json" => Ok(OutputFormat::Json),
         "sarif" => Ok(OutputFormat::Sarif),
         "cyclonedx" => Ok(OutputFormat::CycloneDx),
+        "html" => Ok(OutputFormat::Html),
         _ => Err(format!(
-            "Unsupported output format: {value}. Use text, json, sarif or cyclonedx."
+            "Unsupported output format: {value}. Use text, json, sarif, cyclonedx or html."
         )),
     }
 }
@@ -120,8 +160,8 @@ pub fn apply_advisory_ignores(
         };
         if !findings.iter().any(&matches) {
             warnings.push(format!(
-                "cargoscope.toml ignores {}, which matches no advisory of this project: remove it if it is no longer needed",
-                ignore.id
+                "{} ignores {}, which matches no advisory of this project: remove it if it is no longer needed",
+                ignore.source, ignore.id
             ));
             continue;
         }
@@ -185,19 +225,48 @@ fn run_scan(options: &ScanOptions) -> Result<ExitCode, ExitCode> {
     } else {
         (vec![PackageInfo::default(); inventory.packages.len()], None)
     };
-    // Clarified licenses replace the registry's everywhere in the report.
-    if let Some(policy) = &policy {
-        policy.clarify(&inventory, &mut package_info);
-    }
+    // Clarified licenses (verified against on-disk license-files hashes when
+    // specified) replace the registry's everywhere in the report.
     let violations = match policy {
-        Some(policy) => Some(check_policy(
-            root,
-            &policy,
-            &inventory,
-            &package_info,
-            registry_date.as_deref(),
-            &mut warnings,
-        )?),
+        Some(policy) => {
+            let (verified_clarifications, clarify_warnings) =
+                cargoscope_cargo::crate_sources::verify_clarifications(
+                    root,
+                    &inventory,
+                    &policy.license_clarifications,
+                );
+            warnings.extend(clarify_warnings);
+            policy.clarify_verified(&inventory, &mut package_info, &verified_clarifications);
+            // Licenses of the project's own packages, git and other registries,
+            // and of crates without a usable `license` field (from LICENSE files).
+            let gathered = cargoscope_cargo::licenses::gather(
+                root,
+                &inventory,
+                &policy,
+                &package_info,
+                &verified_clarifications,
+            );
+            for ((info, facts), license) in package_info
+                .iter_mut()
+                .zip(&gathered.facts)
+                .zip(gathered.licenses)
+            {
+                if facts.known {
+                    info.license = license;
+                }
+            }
+            warnings.extend(gathered.warnings);
+            Some(check_policy(
+                root,
+                &policy,
+                &inventory,
+                &package_info,
+                registry_date.as_deref(),
+                &verified_clarifications,
+                &gathered.facts,
+                &mut warnings,
+            )?)
+        }
         None => None,
     };
     keep_checked_info(&mut package_info, checks);
@@ -264,7 +333,7 @@ fn load_policy(root: &Path) -> Result<Option<Policy>, ExitCode> {
 
 /// crates.io data (licenses, latest versions, yanked status) of every package
 /// and its download date, with warnings when it is missing or incomplete.
-fn registry_data(
+pub(crate) fn registry_data(
     root: &Path,
     inventory: &Inventory,
     warnings: &mut Vec<String>,
@@ -299,23 +368,39 @@ fn registry_data(
     (package_info, registry_date)
 }
 
+#[allow(clippy::too_many_arguments)] // each argument is a separate input of the policy
 fn check_policy(
     root: &Path,
     policy: &Policy,
     inventory: &Inventory,
     package_info: &[PackageInfo],
     registry_date: Option<&str>,
+    verified_clarifications: &[Option<usize>],
+    license_facts: &[cargoscope_core::policy::LicenseFacts],
     warnings: &mut Vec<String>,
 ) -> Result<Vec<Violation>, ExitCode> {
     if policy.check_licenses && registry_date.is_none() {
         warnings.push("license rules of the policy were skipped: no crates.io data".to_owned());
     }
     warnings.extend(policy.unused_license_entries(inventory));
-    // `[graph]`: only the packages that build uses are checked.
+    // `[graph]` and `[bans] features`: limit rules or collect enabled features.
     let graph_set = !policy.targets.is_empty()
         || policy.features.is_some()
         || policy.exclude_dev
-        || policy.exclude_unpublished;
+        || policy.exclude_unpublished
+        || policy.root_package_only;
+    let checks_duplicates = policy.multiple_versions != LintLevel::Allow
+        || !policy.deny_multiple_versions_of.is_empty();
+    let needs_non_dev = ((policy.duplicates_exclude_dev && checks_duplicates)
+        || (policy.licenses_exclude_dev && policy.check_licenses))
+        && !policy.exclude_dev;
+    let needs_features = !policy.feature_bans.is_empty()
+        || policy.build_inspection.as_ref().is_some_and(|inspection| {
+            inspection
+                .bypass
+                .iter()
+                .any(|bypass| !bypass.required_features.is_empty())
+        });
     let failed = |error: String| {
         eprintln!(
             "CargoScope could not limit the policy to its [graph]: {error}. Check the target and feature names and run `cargo fetch` first, or remove them from [graph]."
@@ -334,26 +419,66 @@ fn check_policy(
             policy.features.as_ref(),
             exclude_dev,
             &excluded,
+            policy.root_package_only,
         )
     };
-    let active = if graph_set {
-        Some(graph(policy.exclude_dev).map_err(failed)?)
+    let (active, enabled_features) = if graph_set || needs_features {
+        let (packages, features) = graph(policy.exclude_dev).map_err(failed)?;
+        (
+            graph_set.then_some(packages),
+            needs_features.then_some(features),
+        )
     } else {
-        None
+        (None, None)
     };
-    // Duplicates may leave out the dev-dependencies (as cargo-deny does).
-    let duplicates_active = if policy.duplicates_exclude_dev && !policy.exclude_dev {
-        Some(graph(true).map_err(failed)?)
+    // Duplicates and licenses may leave out dev-dependencies (as cargo-deny does).
+    let non_dev_active = if needs_non_dev {
+        Some(
+            cargoscope_cargo::targets::non_dev_packages(
+                root,
+                &policy.targets,
+                policy.features.as_ref(),
+                &excluded,
+                policy.root_package_only,
+            )
+            .map_err(failed)?,
+        )
     } else {
         active.clone()
     };
-    Ok(policy.check_graphs(
+    let build_scripts = if policy.allow_build_scripts.is_some() {
+        let (scripts, build_warnings) = cargoscope_cargo::crate_sources::detect_build_scripts(
+            root,
+            inventory,
+            active.as_ref(),
+            policy.build_include_workspace,
+        );
+        warnings.extend(build_warnings);
+        Some(scripts)
+    } else {
+        None
+    };
+    let context = GraphContext {
+        active: active.as_ref(),
+        non_dev_active: non_dev_active.as_ref(),
+        enabled_features: enabled_features.as_ref(),
+        build_scripts: build_scripts.as_ref(),
+        verified_clarifications: Some(verified_clarifications),
+        license_facts: Some(license_facts),
+    };
+    let mut violations =
+        policy.check_with_context(inventory, package_info, registry_date.is_some(), &context);
+    // Executables and scripts inside the crates that run code at build time.
+    let inspected = cargoscope_cargo::build_inspect::inspect(
+        root,
         inventory,
-        package_info,
-        registry_date.is_some(),
+        policy,
         active.as_ref(),
-        duplicates_active.as_ref(),
-    ))
+        enabled_features.as_ref(),
+    );
+    violations.extend(inspected.violations);
+    warnings.extend(inspected.warnings);
+    Ok(violations)
 }
 
 /// Clears the registry data of checks that did not run, so the report only
@@ -382,6 +507,8 @@ fn write_report(options: &ScanOptions, report: &Report) -> Result<(), ExitCode> 
             cargoscope_report::TextOptions {
                 show_uncertain: options.show_uncertain,
                 verbose: options.verbose,
+                color: options.color.enabled(options.output.is_some()),
+                next_steps: true,
             },
         ),
         OutputFormat::Json => cargoscope_report::render_json(root, report),
@@ -391,6 +518,9 @@ fn write_report(options: &ScanOptions, report: &Report) -> Result<(), ExitCode> 
             options.show_uncertain,
         ),
         OutputFormat::CycloneDx => cargoscope_report::cyclonedx::render_cyclonedx(root, report),
+        OutputFormat::Html => {
+            cargoscope_report::html::render_html(root, report, options.show_uncertain)
+        }
     };
     match &options.output {
         Some(path) => std::fs::write(path, rendered).map_err(|error| {
@@ -435,10 +565,11 @@ fn exit_code(options: &ScanOptions, report: &Report) -> Result<ExitCode, ExitCod
         );
     }
     let policy_fails = options.fail_on != FailOn::Never
-        && report
-            .policy
-            .as_ref()
-            .is_some_and(|violations| !violations.is_empty());
+        && report.policy.as_ref().is_some_and(|violations| {
+            violations
+                .iter()
+                .any(|violation| violation.level == ViolationLevel::Error)
+        });
     let advisory_fails = report
         .advisories
         .iter()
@@ -522,6 +653,8 @@ mod tests {
         assert_eq!(before.fail_on, FailOn::AtLeast(Severity::High));
         let cyclonedx = parse(&["--format", "cyclonedx", "."]).expect("valid");
         assert_eq!(cyclonedx.format, OutputFormat::CycloneDx);
+        let html = parse(&["--format", "html", "."]).expect("valid");
+        assert_eq!(html.format, OutputFormat::Html);
     }
 
     #[test]
@@ -567,6 +700,7 @@ mod tests {
             id: id.to_owned(),
             reason: "known".to_owned(),
             until: until.map(str::to_owned),
+            source: "cargoscope.toml",
         };
         let warnings = super::apply_advisory_ignores(
             &mut findings,

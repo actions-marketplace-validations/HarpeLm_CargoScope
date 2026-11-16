@@ -19,14 +19,14 @@ use crate::{AdvisoryError, io_error, utc_date};
 const DIR: &str = "crates-io";
 const FETCHED_AT_FILE: &str = "fetched-at";
 const INDEX_URL: &str = "https://index.crates.io";
-const API_URL: &str = "https://crates.io/api/v1/crates";
-const USER_AGENT: &str = concat!(
+pub(crate) const API_URL: &str = "https://crates.io/api/v1/crates";
+pub(crate) const USER_AGENT: &str = concat!(
     "cargoscope/",
     env!("CARGO_PKG_VERSION"),
     " (https://github.com/HarpeLm/CargoScope)"
 );
 const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_API_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_API_BYTES: u64 = 4 * 1024 * 1024;
 const API_INTERVAL: Duration = Duration::from_secs(1);
 const NO_LICENSE: &str = "";
 
@@ -126,14 +126,59 @@ fn read_versions(text: &str) -> Vec<PublishedVersion> {
         .collect()
 }
 
-/// Latest non-yanked version: stable first, pre-release only if nothing else.
-fn latest(versions: &[PublishedVersion]) -> Option<&PublishedVersion> {
+/// Latest non-yanked version from `candidates`: stable first, pre-release only
+/// if nothing else.
+fn pick_latest<'a, I>(candidates: I) -> Option<&'a PublishedVersion>
+where
+    I: Iterator<Item = &'a PublishedVersion> + Clone,
+{
     let parse = |version: &PublishedVersion| semver::Version::parse(&version.version).ok();
-    let candidates = || versions.iter().filter(|version| !version.yanked);
-    candidates()
+    candidates
+        .clone()
+        .filter(|version| !version.yanked)
         .filter(|version| parse(version).is_some_and(|parsed| parsed.pre.is_empty()))
         .max_by_key(|version| parse(version))
-        .or_else(|| candidates().max_by_key(|version| parse(version)))
+        .or_else(|| {
+            candidates
+                .filter(|version| !version.yanked)
+                .max_by_key(|version| parse(version))
+        })
+}
+
+/// Latest non-yanked version overall.
+fn latest(versions: &[PublishedVersion]) -> Option<&PublishedVersion> {
+    pick_latest(versions.iter())
+}
+
+/// Latest non-yanked version that is SemVer-compatible with `current`.
+fn latest_compatible<'a>(
+    versions: &'a [PublishedVersion],
+    current: &str,
+) -> Option<&'a PublishedVersion> {
+    let current = semver::Version::parse(current).ok()?;
+    pick_latest(versions.iter().filter(|version| {
+        semver::Version::parse(&version.version)
+            .is_ok_and(|parsed| cargoscope_core::is_semver_compatible(&current, &parsed))
+    }))
+}
+
+/// Spaces crates.io API calls by at least [`API_INTERVAL`].
+#[derive(Debug, Default)]
+pub(crate) struct ApiClock {
+    last: Option<Instant>,
+}
+
+impl ApiClock {
+    /// Sleeps until the next API call is allowed, then records it.
+    pub(crate) fn wait(&mut self) {
+        if let Some(previous) = self.last {
+            let elapsed = previous.elapsed();
+            if elapsed < API_INTERVAL {
+                std::thread::sleep(API_INTERVAL - elapsed);
+            }
+        }
+        self.last = Some(Instant::now());
+    }
 }
 
 /// Summary of a registry refresh.
@@ -145,6 +190,9 @@ pub struct RefreshSummary {
     pub licenses_local: usize,
     /// Licenses fetched from the crates.io API.
     pub licenses_api: usize,
+    /// Direct dependencies whose maintenance data (owners, repository,
+    /// archived status) was fetched; recent data is kept for a week.
+    pub maintenance: usize,
     /// Crates or versions that could not be fetched.
     pub failures: Vec<String>,
 }
@@ -186,7 +234,7 @@ pub fn refresh(
         crate::proxy::agent(API_URL, timeout, Some(USER_AGENT)).map_err(AdvisoryError::Download)?;
     let mut summary = RefreshSummary::default();
     let local_sources = local_registry_sources(cargo_home);
-    let mut last_api_call: Option<Instant> = None;
+    let mut clock = ApiClock::default();
 
     for (name, versions) in wanted {
         let url = format!("{INDEX_URL}/{}", index_path(name));
@@ -209,13 +257,7 @@ pub fn refresh(
                 summary.licenses_local += 1;
                 Some(license)
             } else {
-                if let Some(previous) = last_api_call {
-                    let elapsed = previous.elapsed();
-                    if elapsed < API_INTERVAL {
-                        std::thread::sleep(API_INTERVAL - elapsed);
-                    }
-                }
-                last_api_call = Some(Instant::now());
+                clock.wait();
                 match api_license(&api_agent, name, version) {
                     Ok(license) => {
                         summary.licenses_api += 1;
@@ -235,6 +277,34 @@ pub fn refresh(
         }
     }
 
+    // The repository is read from the newest release: a crate that moved
+    // (to an organisation, say) still names its old, often archived,
+    // repository in older versions.
+    let mut direct: Vec<(&str, String, String)> = inventory
+        .packages
+        .iter()
+        .filter(|package| {
+            package.direct
+                && !package.root
+                && is_crates_io(package.source.as_deref())
+                && is_valid_name(&package.name)
+                && is_valid_version(&package.version)
+        })
+        .map(|package| {
+            let newest = fs::read_to_string(versions_dir.join(&package.name))
+                .ok()
+                .and_then(|text| latest(&read_versions(&text)).map(|v| v.version.clone()))
+                .unwrap_or_else(|| package.version.clone());
+            (package.name.as_str(), newest, package.version.clone())
+        })
+        .collect();
+    direct.sort_unstable();
+    direct.dedup_by(|a, b| a.0 == b.0);
+    let maintenance =
+        crate::maintenance::refresh(&root, &direct, &api_agent, &mut clock, &local_sources)?;
+    summary.maintenance = maintenance.crates;
+    summary.failures.extend(maintenance.failures);
+
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs());
@@ -243,7 +313,7 @@ pub fn refresh(
     Ok(summary)
 }
 
-fn fetch_text(agent: &ureq::Agent, url: &str, limit: u64) -> Result<String, String> {
+pub(crate) fn fetch_text(agent: &ureq::Agent, url: &str, limit: u64) -> Result<String, String> {
     let response = agent.get(url).call().map_err(|error| error.to_string())?;
     let mut text = String::new();
     response
@@ -352,6 +422,21 @@ impl RegistryCache {
                     .find(|version| version.version == package.version)
                     .map(|version| version.yanked);
                 let newest = latest(&versions);
+                let last_release = versions
+                    .iter()
+                    .filter(|version| !version.yanked)
+                    .filter_map(|version| version.published.clone())
+                    .max();
+                let stale = match (&last_release, &self.fetched_on) {
+                    (Some(release), Some(fetched)) => {
+                        years_before(fetched, cargoscope_core::STALE_YEARS)
+                            .is_some_and(|limit| *release <= limit)
+                    }
+                    _ => false,
+                };
+                let maintenance =
+                    crate::maintenance::read(&self.root, &package.name).unwrap_or_default();
+                let compat = latest_compatible(&versions, &package.version);
                 let outdated = newest.is_some_and(|newest| {
                     match (
                         semver::Version::parse(&newest.version),
@@ -365,19 +450,33 @@ impl RegistryCache {
                     license,
                     latest_version: newest.map(|version| version.version.clone()),
                     latest_published: newest.and_then(|version| version.published.clone()),
+                    latest_compatible: compat.map(|version| version.version.clone()),
+                    compatible_published: compat.and_then(|version| version.published.clone()),
                     yanked,
                     outdated,
+                    last_release,
+                    stale,
+                    owners: maintenance.owners,
+                    repository: maintenance.repository,
+                    archived: maintenance.archived,
                 }
             })
             .collect()
     }
 }
 
+/// The same day `years` years before `date` (`YYYY-MM-DD`).
+fn years_before(date: &str, years: u32) -> Option<String> {
+    let (year, rest) = date.split_once('-')?;
+    let year: u32 = year.parse().ok()?;
+    Some(format!("{:04}-{rest}", year.checked_sub(years)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PublishedVersion, format_versions, index_path, is_valid_name, latest, parse_index,
-        read_versions,
+        PublishedVersion, format_versions, index_path, is_valid_name, latest, latest_compatible,
+        parse_index, read_versions, years_before,
     };
 
     fn version(text: &str, yanked: bool) -> PublishedVersion {
@@ -431,5 +530,46 @@ not json
             latest(&only_pre).map(|v| v.version.as_str()),
             Some("0.1.0-beta")
         );
+    }
+
+    #[test]
+    fn latest_compatible_respects_cargo_semver_caret_ranges() {
+        let v1 = vec![
+            version("1.0.0", false),
+            version("1.3.2", false),
+            version("1.4.0", true),
+            version("2.0.0", false),
+        ];
+        assert_eq!(
+            latest_compatible(&v1, "1.0.0").map(|v| v.version.as_str()),
+            Some("1.3.2")
+        );
+
+        let v0 = vec![
+            version("0.8.1", false),
+            version("0.8.9", false),
+            version("0.9.0", false),
+        ];
+        assert_eq!(
+            latest_compatible(&v0, "0.8.1").map(|v| v.version.as_str()),
+            Some("0.8.9")
+        );
+        assert_eq!(
+            latest_compatible(&v0, "0.9.0").map(|v| v.version.as_str()),
+            Some("0.9.0")
+        );
+
+        let v00 = vec![version("0.0.2", false), version("0.0.3", false)];
+        assert_eq!(
+            latest_compatible(&v00, "0.0.2").map(|v| v.version.as_str()),
+            Some("0.0.2")
+        );
+    }
+
+    #[test]
+    fn computes_the_stale_limit() {
+        assert_eq!(years_before("2026-11-15", 2).as_deref(), Some("2024-11-15"));
+        assert_eq!(years_before("2024-02-29", 2).as_deref(), Some("2022-02-29"));
+        assert_eq!(years_before("bad", 2), None);
     }
 }

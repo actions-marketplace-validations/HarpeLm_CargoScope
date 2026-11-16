@@ -249,11 +249,11 @@ fn reports_licenses_versions_and_yanked_packages() {
     assert!(text.contains(
         "Yanked versions in use: 1\n- itoa 1.0.11\n    via simple -> serde_json -> itoa\n"
     ));
-    // 1.0.300 is yanked and 2.0.0-alpha.1 is a pre-release: the latest is 1.0.200.
+    // 1.0.300 is yanked and 2.0.0-alpha.1 is a pre-release: the latest is 1.0.200 (compatible).
     assert!(text.contains(
-        "Outdated packages: 1 (1 direct)\n- serde_json 1.0.128 -> 1.0.200, published 2025-12-01\n"
+        "Outdated packages: 1 (1 direct)\n- serde_json 1.0.128 -> 1.0.200 (compatible), published 2025-12-01\n"
     ));
-    assert!(text.contains("- serde_json 1.0.128 [direct] (registry+https://github.com/rust-lang/crates.io-index) MIT OR Apache-2.0 -> 1.0.200 available\n"));
+    assert!(text.contains("- serde_json 1.0.128 [direct] (registry+https://github.com/rust-lang/crates.io-index) MIT OR Apache-2.0 -> 1.0.200 (compatible) available\n"));
     assert!(text.contains("- itoa 1.0.11 [transitive] (registry+https://github.com/rust-lang/crates.io-index) YANKED\n"));
     assert!(!text.contains("no crates.io data"));
 }
@@ -264,7 +264,110 @@ fn json_output_includes_registry_data() {
     assert!(
         json.contains("\"registry\":{\"source\":\"crates.io\",\"downloaded_on\":\"2026-01-01\"}")
     );
-    assert!(json.contains("\"license\":\"MIT OR Apache-2.0\",\"latest_version\":\"1.0.200\",\"latest_published\":\"2025-12-01\",\"outdated\":true,\"yanked\":false}"));
+    assert!(json.contains("\"license\":\"MIT OR Apache-2.0\",\"latest_version\":\"1.0.200\",\"latest_published\":\"2025-12-01\",\"latest_compatible\":\"1.0.200\",\"compatible_published\":\"2025-12-01\",\"outdated\":true,\"outdated_kind\":\"compatible\",\"yanked\":false,\"last_release\":\"2025-12-20\",\"owners\":[\"dtolnay\"],\"repository\":\"https://github.com/serde-rs/json\",\"archived\":false,\"maintenance\":[\"single-owner\"]}"));
+}
+
+#[test]
+fn text_report_lists_direct_dependencies_to_watch() {
+    let text = stdout(&scan("simple", &["--fail-on", "none"]));
+    assert!(text.contains("1 direct to watch"), "{text}");
+    assert!(
+        text.contains("Maintenance: 1 of 1 direct dependencies to watch\n- serde_json 1.0.128: single owner (dtolnay)\n"),
+        "{text}"
+    );
+    let html = stdout(&scan("simple", &["--format", "html", "--fail-on", "none"]));
+    assert!(
+        html.contains(
+            "<span class=\"badge badge-warn\">single-owner</span> single owner (dtolnay)"
+        )
+    );
+}
+
+#[test]
+fn distinguishes_semver_compatible_and_breaking_updates() {
+    let cache = std::env::temp_dir().join(format!("cargoscope-semver-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cache);
+    let versions_dir = cache.join("crates-io/versions");
+    std::fs::create_dir_all(&versions_dir).expect("create versions cache");
+    std::fs::write(cache.join("crates-io/fetched-at"), "1767225600\n").expect("fetched-at");
+    // serde_json is 1.0.128: has both compatible 1.0.200 and breaking 2.0.0.
+    std::fs::write(
+        versions_dir.join("serde_json"),
+        "1.0.128\tfalse\t2024-09-01\n1.0.200\tfalse\t2025-12-01\n2.0.0\tfalse\t2026-01-01\n",
+    )
+    .expect("serde_json versions");
+    // serde is 1.0.210: only breaking 2.0.0 exists.
+    std::fs::write(
+        versions_dir.join("serde"),
+        "1.0.210\tfalse\t2024-09-01\n2.0.0\tfalse\t2026-01-01\n",
+    )
+    .expect("serde versions");
+
+    let text = stdout(&scan_with_cache(
+        "simple",
+        &[
+            "--checks",
+            "inventory,versions,licenses",
+            "--fail-on",
+            "none",
+        ],
+        &cache,
+    ));
+    assert!(text.contains(
+        "- serde_json 1.0.128 -> 1.0.200 (compatible), 2.0.0 (breaking), published 2026-01-01\n"
+    ));
+    assert!(text.contains("serde 1.0.210 [transitive]"));
+    assert!(text.contains("-> 2.0.0 (breaking) available\n"));
+
+    let json: serde_json::Value = serde_json::from_slice(
+        &scan_with_cache(
+            "simple",
+            &[
+                "--checks",
+                "inventory,versions,licenses",
+                "--format",
+                "json",
+                "--fail-on",
+                "none",
+            ],
+            &cache,
+        )
+        .stdout,
+    )
+    .expect("json parses");
+    let packages = json["packages"].as_array().expect("packages");
+    let serde_json = packages
+        .iter()
+        .find(|p| p["name"] == "serde_json")
+        .expect("serde_json");
+    assert_eq!(serde_json["latest_compatible"], "1.0.200");
+    assert_eq!(serde_json["latest_version"], "2.0.0");
+    assert_eq!(serde_json["outdated_kind"], "both");
+    let serde = packages
+        .iter()
+        .find(|p| p["name"] == "serde")
+        .expect("serde");
+    assert_eq!(serde["latest_compatible"], "1.0.210");
+    assert_eq!(serde["latest_version"], "2.0.0");
+    assert_eq!(serde["outdated_kind"], "breaking");
+
+    let html = stdout(&scan_with_cache(
+        "simple",
+        &[
+            "--checks",
+            "inventory,versions,licenses",
+            "--format",
+            "html",
+            "--fail-on",
+            "none",
+        ],
+        &cache,
+    ));
+    assert!(html.contains(">both<"));
+    assert!(html.contains("1.0.200"));
+    assert!(html.contains("2.0.0 (breaking)"));
+
+    let _ = std::fs::remove_dir_all(&cache);
 }
 
 #[test]
@@ -494,6 +597,56 @@ fn cyclonedx_exports_components_licenses_dependencies_and_vulnerabilities() {
 }
 
 #[test]
+fn html_exports_self_contained_report_with_findings_and_output_file() {
+    let report_path =
+        std::env::temp_dir().join(format!("cargoscope-html-{}.html", std::process::id()));
+    let output = scan(
+        "simple",
+        &[
+            "--format",
+            "html",
+            "--fail-on",
+            "none",
+            "--output",
+            report_path.to_str().expect("utf8 path"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stdout(&output).is_empty());
+
+    let html = std::fs::read_to_string(&report_path).expect("written html file");
+    let _ = std::fs::remove_file(&report_path);
+    assert!(html.starts_with("<!DOCTYPE html>\n"));
+    assert!(html.contains("<style>"));
+    assert!(html.contains("<svg "));
+    assert!(html.contains("CARGOSCOPE-TEST-0001"));
+    assert!(html.contains("serde_json"));
+    assert!(html.contains("MIT OR Apache-2.0"));
+
+    fn unused_section(doc: &str) -> &str {
+        let start = doc.find("<section id=\"unused\"").expect("unused section");
+        let rest = &doc[start..];
+        let end = rest.find("</section>").expect("closing unused section");
+        &rest[..end]
+    }
+
+    let unused_default = stdout(&scan("unused", &["--format", "html", "--fail-on", "none"]));
+    assert!(unused_section(&unused_default).contains("possibly-unused"));
+    assert!(unused_section(&unused_default).contains("log"));
+    assert!(unused_section(&unused_default).contains("kept for an upcoming feature"));
+    assert!(!unused_section(&unused_default).contains("chrono"));
+
+    let unused_uncertain = stdout(&scan(
+        "unused",
+        &["--format", "html", "--show-uncertain", "--fail-on", "none"],
+    ));
+    assert!(unused_section(&unused_uncertain).contains("chrono"));
+
+    let policy_html = stdout(&scan("policy", &["--format", "html", "--fail-on", "none"]));
+    assert!(policy_html.contains("Policy Violations"));
+}
+
+#[test]
 fn inventory_only_scan_needs_no_advisory_database() {
     let empty =
         std::env::temp_dir().join(format!("cargoscope-inventory-only-{}", std::process::id()));
@@ -586,7 +739,17 @@ fn package_list_is_hidden_without_verbose() {
         .expect("cargoscope binary runs");
     let text = stdout(&output);
     assert!(text.starts_with("CargoScope "));
-    assert!(text.contains("Summary: 1 vulnerability (1 informational), 0 likely-unused, 1 yanked, 1 outdated direct, 4 packages\n"));
+    assert!(
+        text.contains(" · 4 packages · data from 2026-01-01\n"),
+        "{text}"
+    );
+    assert!(text.contains("  ✖ 1 vulnerable crate   ⚠ 1 notice   ✔ no unused dependency"));
+    assert!(text.contains("\nVulnerabilities\n  ✖ serde_json 1.0.128  high: "));
+    assert!(text.contains("  fix: 1.0.200\n      via simple › serde_json\n"));
+    assert!(text.contains("\nNotices (not vulnerabilities)\n  unmaintained  itoa\n"));
+    assert!(text.contains("\nNext steps\n  › cargoscope fix --advisories"));
+    // Not a terminal: no ANSI codes.
+    assert!(!text.contains('\u{1b}'));
     assert!(text.contains("Resolved packages: 4 (use --verbose to list them)\n"));
     assert!(!text.contains("- simple 0.1.0 [root]"));
 }
@@ -1231,7 +1394,11 @@ fn audit_bin(file: &str, extra: &[&str]) -> Output {
 
 #[test]
 fn audit_bin_reads_cargo_auditable_data_and_falls_back_to_registry_paths() {
-    let exact = audit_bin("auditable.bin", &[]);
+    let short = stdout(&audit_bin("auditable.bin", &[]));
+    assert!(short.contains("  ✖ serde_json 1.0.128  high: "), "{short}");
+    assert!(!short.contains("cargoscope fix"), "{short}");
+    assert!(!short.contains("not checked"), "{short}");
+    let exact = audit_bin("auditable.bin", &["--verbose"]);
     assert_eq!(exact.status.code(), Some(1));
     let text = stdout(&exact);
     assert!(
@@ -1251,7 +1418,7 @@ fn audit_bin_reads_cargo_auditable_data_and_falls_back_to_registry_paths() {
             .expect("valid JSON");
     assert_eq!(json["advisories"][0]["id"], "CARGOSCOPE-TEST-0001");
 
-    let partial = audit_bin("paths.bin", &["--fail-on", "none"]);
+    let partial = audit_bin("paths.bin", &["--fail-on", "none", "--verbose"]);
     assert_eq!(partial.status.code(), Some(0));
     let text = stdout(&partial);
     assert!(
@@ -1415,6 +1582,7 @@ clarify = [
             "inventory,licenses,policy",
             "--fail-on",
             "none",
+            "--verbose",
         ])
         .arg(&dir)
         .output()
@@ -1556,10 +1724,12 @@ allow-git = ["https://github.com/myorg/"]
         text.contains("no cargoscope.toml: the rules of deny.toml (cargo-deny) are used"),
         "{text}"
     );
+    // As in cargo-deny: an allowed license no package uses is a warning.
     assert!(
-        text.contains("[licenses] confidence-threshold not supported"),
+        text.contains("- [license] [warning] policy-demo 0.1.0: license `BSD-3-Clause` is allowed but no checked package uses it (unused-allowed-license)"),
         "{text}"
     );
+    assert!(!text.contains("confidence-threshold"), "{text}");
 
     // Without the wrapper, the ban applies.
     let deny = std::fs::read_to_string(dir.join("deny.toml")).expect("read");
@@ -1575,6 +1745,95 @@ allow-git = ["https://github.com/myorg/"]
     let text = stdout(&run());
     assert!(!text.contains("deny.toml"), "{text}");
     assert!(!text.contains("- [ban] serde"), "{text}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn bans_features_report_banned_unallowed_and_missing_features() {
+    let dir = std::env::temp_dir().join(format!("cargoscope-feat-bans-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    copy_dir(&fixture("policy"), &dir);
+    std::fs::remove_file(dir.join("cargoscope.toml")).expect("remove");
+    std::fs::write(
+        dir.join("deny.toml"),
+        "[[bans.features]]\ncrate = \"serde\"\ndeny = [\"std\"]\nallow = [\"default\"]\nexact = true\n",
+    )
+    .expect("write deny.toml");
+
+    let fake_src = dir.join("fake_cargo.rs");
+    let fake_bin = dir.join(format!("fake-cargo{}", std::env::consts::EXE_SUFFIX));
+    std::fs::write(
+        &fake_src,
+        r##"fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    assert!(args.windows(2).any(|w| w[0] == "--format" && w[1] == "{p} [{f}]"), "{args:?}");
+    let feats = std::env::var("FAKE_SERDE_FEATURES").unwrap_or_else(|_| "std".to_owned());
+    println!("policy-demo v0.1.0 (/work) []\nserde_json v1.0.128 [default]\nserde v1.0.210 [{feats}]\nitoa v1.0.11 []\nforked v0.1.0 (https://github.com/someone/forked?rev=abc#abc) []");
+}
+"##,
+    )
+    .expect("write fake cargo");
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let compiled = Command::new(rustc)
+        .arg(&fake_src)
+        .arg("-o")
+        .arg(&fake_bin)
+        .output()
+        .expect("rustc runs");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    let run = |feats: &str| {
+        Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+            .env("CARGOSCOPE_CACHE_DIR", fixture("advisory-cache"))
+            .env("CARGO_HOME", fixture("empty-cargo-home"))
+            .env("CARGO", &fake_bin)
+            .env("FAKE_SERDE_FEATURES", feats)
+            .args(["scan", "--checks", "inventory,policy", "--fail-on", "none"])
+            .arg(&dir)
+            .output()
+            .expect("cargoscope binary runs")
+    };
+
+    // With `std` enabled and `default` missing: banned `std` + exact missing `default`.
+    let bad = stdout(&run("std"));
+    assert!(
+        bad.contains("- [ban] serde 1.0.210: feature `std` is banned: from deny.toml"),
+        "{bad}"
+    );
+    assert!(
+        bad.contains("- [ban] serde 1.0.210: exact feature set required, missing feature `default`: from deny.toml"),
+        "{bad}"
+    );
+
+    // With an unexpected feature `alloc` and `default` enabled: unallowed `alloc`.
+    let extra = stdout(&run("alloc,default"));
+    assert!(
+        extra.contains(
+            "- [ban] serde 1.0.210: feature `alloc` is not in the allow list: from deny.toml"
+        ),
+        "{extra}"
+    );
+
+    // With exactly `default`: passes with 0 violations, even via cargoscope.toml.
+    let ok = stdout(&run("default"));
+    assert!(ok.contains("Policy violations: 0"), "{ok}");
+
+    std::fs::write(
+        dir.join("cargoscope.toml"),
+        "[bans]\nfeatures = [{ name = \"serde\", deny = [\"std\"], reason = \"no_std only\" }]\n",
+    )
+    .expect("write cargoscope.toml");
+    let blocked = stdout(&run("default,std"));
+    assert!(
+        blocked.contains("- [ban] serde 1.0.210: feature `std` is banned: no_std only"),
+        "{blocked}"
+    );
+    assert!(stdout(&run("default")).contains("Policy violations: 0"));
+
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1641,4 +1900,346 @@ fn why_shows_reverse_paths_dependents_and_pruning_weight() {
     let missing = run(&["nonexistent", fixture("simple").to_str().expect("utf-8")]);
     assert_eq!(missing.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&missing.stderr).contains("is not in Cargo.lock"));
+}
+
+fn compile_fake_cargo_tree(dir: &std::path::Path, tree_output: &str) -> std::path::PathBuf {
+    let fake_src = dir.join("fake_cargo.rs");
+    let fake_bin = dir.join(format!("fake-cargo{}", std::env::consts::EXE_SUFFIX));
+    let escaped = tree_output.replace('\\', "\\\\").replace('"', "\\\"");
+    std::fs::write(
+        &fake_src,
+        format!(
+            "fn main() {{\n    let args: Vec<String> = std::env::args().collect();\n    assert!(args.iter().any(|a| a == \"tree\"), \"{{args:?}}\");\n    print!(\"{escaped}\");\n}}\n"
+        ),
+    )
+    .expect("write fake cargo");
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let compiled = Command::new(rustc)
+        .arg(&fake_src)
+        .arg("-o")
+        .arg(&fake_bin)
+        .output()
+        .expect("rustc runs");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    fake_bin
+}
+
+#[test]
+fn bans_build_scripts_flag_disallowed_registry_and_workspace_crates() {
+    let dir = std::env::temp_dir().join(format!("cargoscope-build-bans-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    copy_dir(&fixture("policy"), &dir);
+
+    let cargo_home = dir.join("cargo-home");
+    let serde_dir = cargo_home.join("registry/src/index.crates.io-test/serde-1.0.210");
+    std::fs::create_dir_all(&serde_dir).expect("mkdir serde src");
+    std::fs::write(
+        serde_dir.join("Cargo.toml"),
+        "[package]\nname = \"serde\"\nversion = \"1.0.210\"\n",
+    )
+    .expect("serde manifest");
+    std::fs::write(serde_dir.join("build.rs"), "fn main() {}\n").expect("serde build.rs");
+
+    let serde_json_dir = cargo_home.join("registry/src/index.crates.io-test/serde_json-1.0.128");
+    std::fs::create_dir_all(&serde_json_dir).expect("mkdir serde_json src");
+    std::fs::write(
+        serde_json_dir.join("Cargo.toml"),
+        "[package]\nname = \"serde_json\"\nversion = \"1.0.128\"\n",
+    )
+    .expect("serde_json manifest");
+    std::fs::write(serde_json_dir.join("build.rs"), "fn main() {}\n").expect("serde_json build.rs");
+
+    // Workspace root also has a build.rs.
+    std::fs::write(dir.join("build.rs"), "fn main() {}\n").expect("root build.rs");
+    std::fs::remove_file(dir.join("cargoscope.toml")).expect("rm cargoscope.toml");
+    std::fs::write(
+        dir.join("deny.toml"),
+        "[bans.build]\nallow-build-scripts = [\"serde\"]\ninclude-workspace = true\n",
+    )
+    .expect("write deny.toml");
+    let fake_bin = compile_fake_cargo_tree(
+        &dir,
+        "policy-demo v0.1.0 (/work)\nserde_json v1.0.128\nserde v1.0.210\nitoa v1.0.11\nforked v0.1.0 (https://github.com/someone/forked?rev=abc#abc)\n",
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+        .env("CARGOSCOPE_CACHE_DIR", fixture("advisory-cache"))
+        .env("CARGO_HOME", &cargo_home)
+        .env("CARGO", &fake_bin)
+        .args(["scan", "--checks", "inventory,policy"])
+        .arg(&dir)
+        .output()
+        .expect("cargoscope binary runs");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("- [ban] policy-demo 0.1.0: build script of `policy-demo` is not in [bans.build] allow-build-scripts"),
+        "{text}"
+    );
+    assert!(
+        text.contains("- [ban] serde_json 1.0.128: build script of `serde_json` is not in [bans.build] allow-build-scripts"),
+        "{text}"
+    );
+    assert!(!text.contains("build script of `serde`"), "{text}");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn clarify_license_files_hash_accepts_match_and_rejects_mismatch() {
+    let dir = std::env::temp_dir().join(format!("cargoscope-clarify-hash-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    copy_dir(&fixture("policy"), &dir);
+
+    let cargo_home = dir.join("cargo-home");
+    let itoa_dir = cargo_home.join("registry/src/index.crates.io-test/itoa-1.0.11");
+    std::fs::create_dir_all(&itoa_dir).expect("mkdir itoa");
+    std::fs::write(
+        itoa_dir.join("Cargo.toml"),
+        "[package]\nname = \"itoa\"\nversion = \"1.0.11\"\n",
+    )
+    .expect("itoa manifest");
+    std::fs::write(itoa_dir.join("LICENSE"), "MIT\r\n").expect("itoa LICENSE");
+    let matching_hash =
+        cargoscope_cargo::crate_sources::hash_license_reader(std::io::Cursor::new(b"MIT\n"))
+            .expect("hash");
+
+    std::fs::remove_file(dir.join("cargoscope.toml")).expect("rm cargoscope.toml");
+    let fake_bin = compile_fake_cargo_tree(
+        &dir,
+        "policy-demo v0.1.0 (/work)\nserde_json v1.0.128\nserde v1.0.210\nitoa v1.0.11\nforked v0.1.0 (https://github.com/someone/forked#0123456789abcdef0123456789abcdef01234567)\n",
+    );
+    let deny_for_hash = |hash: u32| {
+        format!(
+            "[licenses]\nallow = [\"MIT\", \"Apache-2.0\"]\n[[licenses.clarify]]\ncrate = \"itoa\"\nexpression = \"MIT\"\nlicense-files = [{{ path = \"LICENSE\", hash = {hash} }}]\n"
+        )
+    };
+
+    std::fs::write(dir.join("deny.toml"), deny_for_hash(matching_hash)).expect("write deny.toml");
+    let ok = Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+        .env("CARGOSCOPE_CACHE_DIR", fixture("advisory-cache"))
+        .env("CARGO_HOME", &cargo_home)
+        .env("CARGO", &fake_bin)
+        .args(["scan", "--checks", "inventory,licenses,policy"])
+        .arg(&dir)
+        .output()
+        .expect("cargoscope binary runs");
+    assert_eq!(
+        ok.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&ok),
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let ok_text = stdout(&ok);
+    assert!(ok_text.contains("Policy violations: 0"), "{ok_text}");
+
+    std::fs::write(dir.join("deny.toml"), deny_for_hash(matching_hash ^ 1))
+        .expect("write bad hash");
+    let bad = Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+        .env("CARGOSCOPE_CACHE_DIR", fixture("advisory-cache"))
+        .env("CARGO_HOME", &cargo_home)
+        .env("CARGO", &fake_bin)
+        .args(["scan", "--checks", "inventory,licenses,policy"])
+        .arg(&dir)
+        .output()
+        .expect("cargoscope binary runs");
+    assert_eq!(bad.status.code(), Some(1), "{}", stdout(&bad));
+    let bad_text = stdout(&bad);
+    assert!(
+        bad_text.contains("license clarification for itoa 1.0.11 rejected"),
+        "{bad_text}"
+    );
+    assert!(
+        bad_text.contains("- [license] itoa 1.0.11: license is unknown"),
+        "{bad_text}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn licenses_are_detected_from_license_files_when_the_field_is_missing() {
+    let dir = std::env::temp_dir().join(format!("cargoscope-detect-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    copy_dir(&fixture("policy"), &dir);
+    std::fs::remove_file(dir.join("cargoscope.toml")).expect("rm cargoscope.toml");
+    // itoa has no license in the crates.io data, only a LICENSE file.
+    let cargo_home = dir.join("cargo-home");
+    let itoa_dir = cargo_home.join("registry/src/index.crates.io-test/itoa-1.0.11");
+    std::fs::create_dir_all(&itoa_dir).expect("mkdir itoa");
+    std::fs::write(
+        itoa_dir.join("Cargo.toml"),
+        "[package]\nname = \"itoa\"\nversion = \"1.0.11\"\n",
+    )
+    .expect("itoa manifest");
+    let mit =
+        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../LICENSE"))
+            .expect("the repository's MIT license");
+    std::fs::write(itoa_dir.join("LICENSE-MIT"), mit).expect("itoa LICENSE");
+    let fake_bin = compile_fake_cargo_tree(
+        &dir,
+        "policy-demo v0.1.0 (/work)\nserde_json v1.0.128\nserde v1.0.210\nitoa v1.0.11\n",
+    );
+    let run = |allow: &str| {
+        std::fs::write(
+            dir.join("deny.toml"),
+            format!("[licenses]\nallow = [{allow}]\n"),
+        )
+        .expect("write deny.toml");
+        Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+            .env("CARGOSCOPE_CACHE_DIR", fixture("advisory-cache"))
+            .env("CARGO_HOME", &cargo_home)
+            .env("CARGO", &fake_bin)
+            .args(["scan", "--checks", "inventory,licenses,policy"])
+            .arg(&dir)
+            .output()
+            .expect("cargoscope binary runs")
+    };
+    let ok = run("\"MIT\", \"Apache-2.0\"");
+    assert_eq!(ok.status.code(), Some(0), "{}", stdout(&ok));
+    assert!(
+        stdout(&ok).contains("Policy violations: 0"),
+        "{}",
+        stdout(&ok)
+    );
+
+    let bad = run("\"Apache-2.0\"");
+    let text = stdout(&bad);
+    assert_eq!(bad.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("- [license] itoa 1.0.11: license `MIT` (detected in LICENSE-MIT) is not allowed by the policy"),
+        "{text}"
+    );
+    // The project's own license is checked too, as in cargo-deny.
+    assert!(
+        text.contains("- [license] policy-demo 0.1.0: license `MIT` is not allowed by the policy"),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn executables_in_build_time_crates_are_reported() {
+    let dir = std::env::temp_dir().join(format!("cargoscope-exes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    copy_dir(&fixture("policy"), &dir);
+    std::fs::remove_file(dir.join("cargoscope.toml")).expect("rm cargoscope.toml");
+    // itoa gets a build script, a prebuilt ELF and a shell script.
+    let cargo_home = dir.join("cargo-home");
+    let itoa_dir = cargo_home.join("registry/src/index.crates.io-test/itoa-1.0.11");
+    std::fs::create_dir_all(itoa_dir.join("bin")).expect("mkdir itoa");
+    std::fs::write(
+        itoa_dir.join("Cargo.toml"),
+        "[package]\nname = \"itoa\"\nversion = \"1.0.11\"\nlicense = \"MIT\"\n",
+    )
+    .expect("itoa manifest");
+    std::fs::write(itoa_dir.join("build.rs"), "fn main() {}\n").expect("build.rs");
+    let mut elf = b"\x7fELF\x02\x01\x01".to_vec();
+    elf.resize(64, 0);
+    std::fs::write(itoa_dir.join("bin/tool"), elf).expect("elf");
+    std::fs::write(itoa_dir.join("gen.sh"), "#!/bin/sh\necho generating code\n").expect("script");
+    let fake_bin = compile_fake_cargo_tree(
+        &dir,
+        "policy-demo v0.1.0 (/work)\nserde_json v1.0.128\nserde v1.0.210\nitoa v1.0.11\n",
+    );
+    let run = |build: &str| {
+        std::fs::write(dir.join("deny.toml"), format!("[bans.build]\n{build}")).expect("deny.toml");
+        Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+            .env("CARGOSCOPE_CACHE_DIR", fixture("advisory-cache"))
+            .env("CARGO_HOME", &cargo_home)
+            .env("CARGO", &fake_bin)
+            .args(["scan", "--checks", "inventory,policy"])
+            .arg(&dir)
+            .output()
+            .expect("cargoscope binary runs")
+    };
+    let out = run("");
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("- [ban] itoa 1.0.11: `bin/tool` in `itoa` is an executable (elf), and `itoa` runs code at build time"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("gen.sh"),
+        "scripts are allowed by default: {text}"
+    );
+
+    let text = stdout(&run(
+        "interpreted = \"warn\"\nbypass = [{ crate = \"itoa\", allow = [{ path = \"bin/tool\" }] }]\n",
+    ));
+    assert!(!text.contains("bin/tool"), "{text}");
+    assert!(
+        text.contains("- [ban] [warning] itoa 1.0.11: `gen.sh` in `itoa` is a sh script"),
+        "{text}"
+    );
+
+    let text = stdout(&run("script-extensions = [\"sh\"]\n"));
+    assert!(
+        text.contains("`gen.sh` in `itoa` matches the script extension `*.sh`"),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn warn_level_policies_emit_warnings_without_failing_scan() {
+    let dir = std::env::temp_dir().join(format!("cargoscope-warn-level-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    copy_dir(&fixture("multi-version"), &dir);
+    let fake_bin = compile_fake_cargo_tree(
+        &dir,
+        "multi-version v0.1.0 (/work)\nold-wrapper v1.0.0\nbitflags v1.3.2\nbitflags v2.6.0\n",
+    );
+    std::fs::write(
+        dir.join("deny.toml"),
+        "[bans]\nmultiple-versions = \"warn\"\nmultiple-versions-include-dev = true\n[sources]\nunknown-git = \"warn\"\nunknown-registry = \"warn\"\n",
+    )
+    .expect("write deny.toml");
+
+    let run = |format: &str| {
+        Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+            .env("CARGOSCOPE_CACHE_DIR", fixture("advisory-cache"))
+            .env("CARGO_HOME", fixture("empty-cargo-home"))
+            .env("CARGO", &fake_bin)
+            .args(["scan", "--checks", "inventory,policy", "--format", format])
+            .arg(&dir)
+            .output()
+            .expect("cargoscope binary runs")
+    };
+
+    let text_out = run("text");
+    assert_eq!(
+        text_out.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&text_out),
+        String::from_utf8_lossy(&text_out.stderr)
+    );
+    let text = stdout(&text_out);
+    assert!(text.contains("Policy violations: 0 (1 warning)"), "{text}");
+    assert!(
+        text.contains("- [multiple-versions] [warning] bitflags"),
+        "{text}"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&run("json").stdout).expect("json");
+    assert_eq!(json["policy"][0]["level"], "warning");
+    assert_eq!(json["policy"][0]["rule"], "multiple-versions");
+
+    let sarif: serde_json::Value = serde_json::from_slice(&run("sarif").stdout).expect("sarif");
+    assert_eq!(sarif["runs"][0]["results"][0]["level"], "warning");
+
+    let _ = std::fs::remove_dir_all(dir);
 }

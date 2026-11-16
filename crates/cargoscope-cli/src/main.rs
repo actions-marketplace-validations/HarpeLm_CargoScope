@@ -8,6 +8,7 @@ mod audit_bin;
 mod compare;
 mod fix;
 mod fix_advisories;
+mod fix_updates;
 mod scan;
 mod why;
 
@@ -26,10 +27,11 @@ const COMPARE_USAGE: &str = "  cargoscope compare BASELINE CURRENT [--format tex
       Compare two JSON reports (markdown: for a pull request comment). Exit code 1 when new advisories reach the threshold.";
 
 const AUDIT_BIN_USAGE: &str =
-    "  cargoscope audit-bin FILE... [--format text|json] [--fail-on THRESHOLD]
+    "  cargoscope audit-bin FILE... [--format text|json] [--fail-on THRESHOLD] [--verbose]
       Report the advisories of the crates compiled into Rust binaries. Exact
       with binaries built by `cargo auditable build`; otherwise the crates
-      named by panic message paths only (incomplete). The files are only read.";
+      named by panic message paths only (incomplete). The files are only read.
+      --verbose lists every advisory in full and every crate found.";
 
 const WHY_USAGE: &str = "  cargoscope why CRATE[@VERSION] [PATH] [--format text|json]
       Show every dependency chain from the project's root packages to CRATE,
@@ -47,14 +49,21 @@ const FIX_USAGE: &str = "  cargoscope fix [PATH] [--dry-run | --apply] [--only N
       Update vulnerable packages to the smallest fixed version Cargo accepts
       (in Cargo.lock, and in Cargo.toml when a direct requirement blocks the
       fix), and say which dependency blocks the others. Runs cargo update,
-      which may read the registry index; it compiles nothing.";
+      which may read the registry index; it compiles nothing.
+  cargoscope fix --updates [PATH] [--breaking] [--dry-run | --apply] [--only NAMES]
+                 [--format text|markdown|json]
+      Update direct dependencies to their newest SemVer-compatible version in
+      Cargo.lock, as Dependabot version updates do. With --breaking, try the
+      newest major version first, raising the requirement in Cargo.toml.
+      Needs the crates.io data of `cargoscope update`; compiles nothing.";
 
-const SCAN_USAGE: &str = "  cargoscope scan [PATH] [--format text|json|sarif|cyclonedx] [--output FILE] [--fail-on THRESHOLD] [--show-uncertain] [--verbose] [--precise]
+const SCAN_USAGE: &str = "  cargoscope scan [PATH] [--format text|json|sarif|cyclonedx|html] [--output FILE] [--fail-on THRESHOLD] [--show-uncertain] [--verbose] [--precise] [--color WHEN]
       Report on a Cargo project, read-only and offline.
 
 Options for scan:
-  --format text|json|sarif|cyclonedx
-                       Output format (default: text; cyclonedx: CycloneDX 1.5 SBOM).
+  --format text|json|sarif|cyclonedx|html
+                       Output format (default: text; cyclonedx: CycloneDX 1.5 SBOM;
+                       html: self-contained offline report).
   --output FILE        Write the report to FILE instead of standard output.
   --fail-on THRESHOLD  none, low, medium, high or critical.
                        Default: fail on any security vulnerability.
@@ -66,7 +75,10 @@ Options for scan:
   --precise            Confirm unused dependencies with rustc (cargo check, all
                        targets and features). COMPILES THE PROJECT: build
                        scripts and proc macros run. Never enabled by default.
-  -v, --verbose        List every resolved package (text format).
+  -v, --verbose        Full text report: every advisory in detail and every
+                       resolved package.
+  --color WHEN         auto, always or never (default: auto: colors only on a
+                       terminal, without NO_COLOR, and not with --output).
   --baseline FILE      A previous JSON report: advisories already in it do not
                        fail the scan, so only new ones do.
   --checks LIST        Comma-separated checks to run (default: all):
@@ -263,11 +275,25 @@ fn update(project_root: &Path) -> ExitCode {
         "Refreshing crates.io data for {} (licenses not found locally are fetched at most once per second)...",
         project_root.display()
     );
+    let direct = inventory
+        .packages
+        .iter()
+        .filter(|package| {
+            package.direct && !package.root && crates_io::is_crates_io(package.source.as_deref())
+        })
+        .map(|package| package.name.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    if direct > 30 {
+        println!(
+            "Maintenance data of {direct} direct dependencies: up to {direct} s the first time (crates.io asks for one request per second), then kept for a week."
+        );
+    }
     match crates_io::refresh(&cache, &inventory, cargo_home.as_deref()) {
         Ok(summary) => {
             println!(
-                "crates.io data updated: {} crates, {} licenses from local sources, {} from the crates.io API",
-                summary.crates, summary.licenses_local, summary.licenses_api
+                "crates.io data updated: {} crates, {} licenses from local sources, {} from the crates.io API, maintenance data of {} direct dependencies",
+                summary.crates, summary.licenses_local, summary.licenses_api, summary.maintenance
             );
             for failure in &summary.failures {
                 eprintln!("warning: {failure}");

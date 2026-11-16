@@ -9,7 +9,7 @@ A release is started by pushing a version tag. Everything else runs in GitHub Ac
 | Homebrew (`brew install HarpeLm/tap/cargoscope`) | `release.yml` | `HarpeLm/homebrew-tap` repository and `HOMEBREW_TAP_TOKEN` secret |
 | npm (`npx cargoscope`) | `release.yml` | `NPM_TOKEN` secret |
 | PyPI (`pip install cargoscope`, `uvx cargoscope`) | `pypi.yml`, **not enabled yet** | PyPI trusted publisher (no token), then restore the tag trigger in `pypi.yml` |
-| GitHub Action (`uses: HarpeLm/CargoScope@v0.5.1`) | `action.yml` at the repository root | The GitHub Release |
+| GitHub Action (`uses: HarpeLm/CargoScope@v0.7.0`) | `action.yml` at the repository root | The GitHub Release |
 
 ## v0.1.0 checklist
 
@@ -81,6 +81,22 @@ Prepared on 2026-11-15: `cargoscope fix --advisories` (dry run, `--apply`, `--fo
 ## v0.5.1
 
 Released on 2026-11-15: reading cargo-deny's `deny.toml` when there is no `cargoscope.toml` (same result as cargo-deny on 22 of 28 projects), `wrappers` in `[bans]`, "or later" licenses such as `MPL-2.0+`, and corpus-validated unused-dependency rules (`mod r#enum;`, `strum_macros` companion crate, per-package transitive reachability: 233 of 235 correct, 99.1%). ✅ GitHub Release, crates.io (5 crates), npm, Homebrew and the installer report 0.5.1.
+
+## v0.6.0
+
+Released on 2026-11-15: offline HTML report (`--format html`), SemVer compatible vs breaking classification of updates, CycloneDX 1.5 SBOM (`--format cyclonedx`), `cargoscope why`, and full `deny.toml` parity with cargo-deny 0.20.2 on 34 of 34 projects (`[bans] features`, `[bans.build]`, `license-files` hashes, `"warn"` levels, graph fixes). Before tagging: `cargo clean`, then `cargo package --workspace --exclude cargoscope-corpus` (see the 0.5.0 note on stale local builds).
+
+- ✅ `cargo clean` then `cargo package --workspace --exclude cargoscope-corpus`: the 5 crates verify. Tag `v0.6.0` pushed; GitHub Release, crates.io (5 crates), npm, Homebrew and the installer report 0.6.0; the Action passes on the 3 operating systems with 0.6.0.
+- ✅ Set the version back to `0.7.0-dev`.
+
+## v0.7.0
+
+Released on 2026-11-16: version update pull requests like Dependabot's (`cargoscope fix --updates [--breaking]`, the Action's `updates`, `updates-grouped`, `labels`, `reviewers`, `commit-prefix` and `auto-merge` inputs, `[updates]` ignore rules, groups, limit and `include-dev` in `cargoscope.toml`, diff.rs and release-note links), maintenance indicators (archived repository, no release for 2 years, single owner), licenses checked as cargo-deny does (license-file detection with `confidence-threshold`, the project's own packages, `[licenses.private]`, `unused-allowed-license`, empty `allow`), `[bans.build]` inspection of build-time crates (executables, scripts, `bypass`), `.cargo/audit.toml` ignores, pre-release advisory ranges read as RustSec does, the unused-dependency detection split into facts, named rules and one decision, and the fixes of the third blind benchmark (80 never-seen repositories).
+
+- ✅ `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`; `cargo clean` then `cargo package --workspace --exclude cargoscope-corpus`: the 5 crates verify; `dist plan`: 6 binaries, installers, Homebrew formula, npm package.
+- The binary grows from about 5 MB to 10 MB with the SPDX license store (the one cargo-deny embeds).
+- ✅ Tag `v0.7.0` pushed (2026-11-16) after CI passed on the 3 operating systems and the minimum Rust version. GitHub Release (20 assets), crates.io (5 crates), npm (`latest`; a local `npm view` showed the old version from its cache for a while), Homebrew and the installer report 0.7.0; the Action passes on the 3 operating systems with 0.7.0.
+- ✅ Set the version back to `0.8.0-dev`.
 
 ## One-time setup (maintainer)
 

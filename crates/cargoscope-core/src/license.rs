@@ -173,6 +173,33 @@ impl Expression {
     }
 }
 
+/// License identifiers of an expression, in order, each with its `WITH`
+/// exception as a second entry (`Apache-2.0` and
+/// `Apache-2.0 WITH LLVM-exception`). An unreadable expression has none.
+#[must_use]
+pub fn ids(expression: &str) -> Vec<String> {
+    fn collect(expression: &Expression, out: &mut Vec<String>) {
+        match expression {
+            Expression::License { id, exception } => {
+                out.push(id.clone());
+                if let Some(exception) = exception {
+                    out.push(format!("{id} WITH {exception}"));
+                }
+            }
+            Expression::Or(parts) | Expression::And(parts) => {
+                for part in parts {
+                    collect(part, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Ok(parsed) = parse(expression) {
+        collect(&parsed, &mut out);
+    }
+    out
+}
+
 /// Checks `expression` against an allow list (empty: every license that is
 /// not denied) and a deny list. Comparison ignores case; an exception
 /// (`WITH ...`) never makes a license unacceptable.
