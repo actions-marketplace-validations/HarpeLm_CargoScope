@@ -338,17 +338,46 @@ pub(crate) fn probe_manifest_update(
     Ok(Some(labels))
 }
 
+/// Whether `version` is in a patched range of every advisory (an advisory
+/// without any fixed version does not count).
+fn fixes_all(version: &semver::Version, patched_sets: &[Vec<String>]) -> bool {
+    patched_sets.iter().all(|patched| {
+        patched.is_empty()
+            || patched.iter().any(|range| {
+                semver::VersionReq::parse(range)
+                    .is_ok_and(|requirement| requirement.matches(version))
+            })
+    })
+}
+
+/// `patched_sets`: the patched ranges of each advisory of the package.
+/// `vulnerable`: whether a version is affected by any vulnerability of the
+/// database (a fix must not move to a version another advisory affects).
 fn plan_package(
     root: &Path,
     package: &Package,
-    patched: &[String],
+    patched_sets: &[Vec<String>],
+    vulnerable: &dyn Fn(&semver::Version) -> bool,
     manifests: &mut Option<Vec<Manifest>>,
 ) -> Result<Step, ExitCode> {
     let spec = format!("{}@{}", package.name, package.version);
-    let versions = candidates(patched, &package.version);
-    if versions.is_empty() {
+    let pooled: Vec<String> = patched_sets.iter().flatten().cloned().collect();
+    let all = candidates(&pooled, &package.version);
+    if all.is_empty() {
         return Ok(Step::Blocked(
             "no fixed version is published for this advisory".to_owned(),
+        ));
+    }
+    // Only versions that fix every advisory of the package and bring none:
+    // quinn-proto 0.11.15 fixes one of seven and is affected by another.
+    let versions: Vec<semver::Version> = all
+        .into_iter()
+        .filter(|version| fixes_all(version, patched_sets) && !vulnerable(version))
+        .collect();
+    if versions.is_empty() {
+        return Ok(Step::Blocked(
+            "no published version fixes every advisory of this package without another one"
+                .to_owned(),
         ));
     }
 
@@ -455,6 +484,22 @@ pub(crate) fn apply_manifest_update(
     Ok(())
 }
 
+/// The version of `name` in `Cargo.lock` now, when `from` is no longer
+/// there and every version of `name` left is at least `target`.
+fn moved_past(root: &Path, name: &str, from: &str, target: &str) -> Option<String> {
+    let inventory = cargoscope_cargo::scan_cargo_project(root).ok()?;
+    let versions: Vec<&str> = inventory
+        .packages
+        .iter()
+        .filter(|package| package.name == name)
+        .map(|package| package.version.as_str())
+        .collect();
+    let target = semver::Version::parse(target).ok()?;
+    let new_enough = |version: &str| semver::Version::parse(version).is_ok_and(|v| v >= target);
+    (!versions.contains(&from) && !versions.is_empty() && versions.iter().all(|v| new_enough(v)))
+        .then(|| versions.join(", "))
+}
+
 fn apply_updates(
     root: &Path,
     rows: &[Row],
@@ -470,6 +515,16 @@ fn apply_updates(
             continue;
         };
         if target_labels.is_empty() {
+            // An earlier update may have moved this package already
+            // (rustls pulls a newer rustls-webpki): skip it when the version
+            // it was planned from is gone and what replaced it is new enough.
+            if let Some(now) = moved_past(root, &row.name, &row.from, version) {
+                eprintln!(
+                    "{} {}: already at {now} after an earlier update",
+                    row.name, row.from
+                );
+                continue;
+            }
             cargo_update(root, spec, version, false).map_err(|error| {
                 eprintln!(
                     "cargo update -p {spec} --precise {version} failed: {}",
@@ -607,6 +662,10 @@ pub fn run(
         eprintln!("warning: {warning}");
     }
 
+    let database = cargoscope_advisory::cache_dir()
+        .ok()
+        .and_then(|dir| cargoscope_advisory::AdvisoryDatabase::open(&dir).ok());
+
     // One step per vulnerable package, ignored advisories left out.
     let mut seen = BTreeSet::new();
     let mut rows: Vec<Row> = Vec::new();
@@ -627,12 +686,36 @@ pub fn run(
             .filter(|other| other.package == finding.package)
             .map(|other| other.id.as_str())
             .collect();
-        let patched: Vec<String> = findings
+        let patched_sets: Vec<Vec<String>> = findings
             .iter()
-            .filter(|other| other.package == finding.package)
-            .flat_map(|other| other.patched.iter().cloned())
+            .filter(|other| {
+                other.package == finding.package
+                    && other.ignored.is_none()
+                    && matches!(other.kind, AdvisoryKind::Vulnerability)
+            })
+            .map(|other| other.patched.clone())
             .collect();
-        let step = plan_package(root, package, &patched, &mut manifests)?;
+        let ignored: BTreeSet<&str> = findings
+            .iter()
+            .filter(|other| other.ignored.is_some())
+            .map(|other| other.id.as_str())
+            .collect();
+        let vulnerable = |version: &semver::Version| {
+            database.as_ref().is_some_and(|database| {
+                let probe = Inventory {
+                    packages: vec![Package {
+                        version: version.to_string(),
+                        dependencies: Vec::new(),
+                        ..package.clone()
+                    }],
+                };
+                database.check(&probe).findings.iter().any(|found| {
+                    matches!(found.kind, AdvisoryKind::Vulnerability)
+                        && !ignored.contains(found.id.as_str())
+                })
+            })
+        };
+        let step = plan_package(root, package, &patched_sets, &vulnerable, &mut manifests)?;
         if !markdown {
             print_step(&package.name, &package.version, &ids, &step);
         }
@@ -664,7 +747,20 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{candidates, reason};
+    use super::{candidates, fixes_all, reason};
+
+    #[test]
+    fn a_fix_must_fix_every_advisory() {
+        // quinn-proto 0.11.14: one advisory fixed in 0.11.15, others in 0.11.19.
+        let sets = vec![
+            vec![">= 0.11.15".to_owned()],
+            vec![">= 0.11.19".to_owned()],
+            vec![],
+        ];
+        let v = |text: &str| semver::Version::parse(text).expect("version");
+        assert!(!fixes_all(&v("0.11.15"), &sets));
+        assert!(fixes_all(&v("0.11.19"), &sets));
+    }
 
     #[test]
     fn candidates_are_the_lower_bounds_of_patched_ranges() {
