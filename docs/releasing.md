@@ -120,6 +120,20 @@ Released on 2026-11-17, right after 0.7.2: `fix --advisories` (and the Action's 
 - After the tag, `main` also got the fix for `--apply` stopping when an earlier update had already moved a package (rustls pulling rustls-webpki): it ships in the next release.
 - ✅ Set the version back to `0.8.0-dev`.
 
+## v0.7.4
+
+Released on 2026-11-17: two `fix --advisories --apply` fixes found while preparing yyjeqhc/webcodex#1426. A package an earlier update already moved is skipped instead of stopping the run (#20), and packages Cargo moved along the way are brought back to their smallest fixed version (#21); a moved package is now detected even when another major version of the same crate stays in `Cargo.lock`.
+
+- ✅ Tag `v0.7.4` pushed (2026-11-17) after CI passed on `main`; `cargo package` verified the 5 crates. GitHub Release (20 assets), crates.io (5 crates), Homebrew and the installer report 0.7.4; npm accepted it and was still processing at the time.
+- ✅ Set the version back to `0.8.0-dev`.
+
+## v0.7.5
+
+Released on 2026-11-17: two unused-dependency false positives found while preparing eval-exec/neomacs#811. Source files' `#[path]` modules and `include!` are followed into the rest of the workspace (neomacs's xtask reuses `neovm-core/build_support/`), and a dev-dependency turning on a test feature of a workspace crate the package also reaches is possibly-unused (`neovm-eval` with `test-support`). Snapshot of 223 repositories: no change on the 70 labelled applications or the 73 libraries.
+
+- ✅ Tag `v0.7.5` pushed (2026-11-17) after CI passed on `main`; `cargo package` verified the 5 crates. GitHub Release (20 assets), crates.io (5 crates), npm, Homebrew and the installer report 0.7.5.
+- ✅ Set the version back to `0.8.0-dev`.
+
 ## One-time setup (maintainer)
 
 1. **crates.io**: create an API token with the `publish-new` and `publish-update` scopes, then add it as the repository secret `CARGO_REGISTRY_TOKEN`.
