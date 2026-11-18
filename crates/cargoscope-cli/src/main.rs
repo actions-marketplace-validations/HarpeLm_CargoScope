@@ -4,6 +4,7 @@
 //! `0` no finding at or above the threshold, `1` threshold reached,
 //! `2` execution error.
 
+mod aggregate;
 mod audit_bin;
 mod compare;
 mod fix;
@@ -32,41 +33,50 @@ const INIT_USAGE: &str = "  cargoscope init [PATH] [--ci] [--policy] [--dry-run]
       --policy, creates cargoscope.toml. Never overwrites existing files unless
       --force is given; --dry-run prints what would be written.";
 
-const COMPARE_USAGE: &str = "  cargoscope compare BASELINE CURRENT [--format text|json|markdown] [--fail-on THRESHOLD]
+const COMPARE_USAGE: &str = "  cargoscope compare BASELINE CURRENT [--format text|json|markdown] [--fail-on THRESHOLD] [--ignore-unlikely] [--color WHEN]
       Compare two JSON reports (markdown: for a pull request comment). Exit code 1 when new advisories reach the threshold.";
 
+const AGGREGATE_USAGE: &str = "  cargoscope aggregate REPORT.json... [--format text|json|html] [--output FILE] [--fail-on THRESHOLD] [--ignore-unlikely] [--color WHEN]
+      Merge JSON reports from several CargoScope scans into one shared view of advisories, licenses, outdated crates and unused dependencies.";
+
 const AUDIT_BIN_USAGE: &str =
-    "  cargoscope audit-bin FILE... [--format text|json] [--fail-on THRESHOLD] [--verbose]
+    "  cargoscope audit-bin FILE... [--format text|json|sarif|cyclonedx|html] [--output FILE] [--fail-on THRESHOLD] [--color WHEN] [--verbose]
       Report the advisories of the crates compiled into Rust binaries. Exact
       with binaries built by `cargo auditable build`; otherwise the crates
       named by panic message paths only (incomplete). The files are only read.
       --verbose lists every advisory in full and every crate found.";
 
-const WHY_USAGE: &str = "  cargoscope why CRATE[@VERSION] [PATH] [--format text|json]
+const WHY_USAGE: &str =
+    "  cargoscope why CRATE[@VERSION] [PATH] [--format text|json] [--color WHEN]
       Show every dependency chain from the project's root packages to CRATE,
       its direct dependents, and how many packages would leave the tree
       without it. Offline and read-only.";
 
-const FIX_USAGE: &str = "  cargoscope fix [PATH] [--dry-run | --apply] [--only NAMES] [--precise]
+const FIX_USAGE: &str =
+    "  cargoscope fix [PATH] [--dry-run | --apply] [--only NAMES] [--include-uncertain] [--precise] [--color WHEN]
       Remove likely-unused dependencies from the Cargo.toml files, and the
       [workspace.dependencies] entries no member uses anymore. Without
       --apply, only shows what would be removed (dry run). --only limits it
-      to a comma-separated list of dependencies. Possibly-unused and ignored
-      dependencies are never removed. Formatting and comments of the
-      manifests are kept; run cargo check afterwards.
-  cargoscope fix --advisories [PATH] [--dry-run | --apply] [--format text|markdown]
+      to a comma-separated list of dependencies (and may also target
+      possibly-unused crates); --include-uncertain includes all possibly-unused
+      dependencies. Ignored dependencies are never removed. Formatting and
+      comments of the manifests are kept; run cargo check afterwards.
+  cargoscope fix --advisories [PATH] [--dry-run | --apply] [--format text|markdown] [--color WHEN]
       Update vulnerable packages to the smallest fixed version Cargo accepts
       (in Cargo.lock, and in Cargo.toml when a direct requirement blocks the
       fix), and say which dependency blocks the others. Runs cargo update,
       which may read the registry index; it compiles nothing.
   cargoscope fix --updates [PATH] [--breaking] [--dry-run | --apply] [--only NAMES]
-                 [--format text|markdown|json]
+                 [--format text|markdown|json] [--color WHEN]
+                 [--comment-command COMMENT --pr-body FILE]
       Update direct dependencies to their newest SemVer-compatible version in
       Cargo.lock, as Dependabot version updates do. With --breaking, try the
       newest major version first, raising the requirement in Cargo.toml.
+      With --comment-command and --pr-body, interpret a PR comment such as
+      `/cargoscope rebase` or `/cargoscope ignore this major version`.
       Needs the crates.io data of `cargoscope update`; compiles nothing.";
 
-const SCAN_USAGE: &str = "  cargoscope scan [PATH] [--update] [--no-maintenance | --fast] [--format text|json|sarif|cyclonedx|html] [--output FILE] [--fail-on THRESHOLD] [--show-uncertain] [--verbose] [--precise] [--color WHEN]
+const SCAN_USAGE: &str = "  cargoscope scan [PATH] [--update] [--no-maintenance | --fast] [--format text|json|sarif|cyclonedx|html] [--output FILE] [--fail-on THRESHOLD] [--ignore-unlikely] [--show-uncertain] [--verbose] [--precise] [--color WHEN]
       Report on a Cargo project, read-only and offline (unless --update is given).
 
 Options for scan:
@@ -84,6 +94,8 @@ Options for scan:
                        Informational advisories (unmaintained, unsound) never fail.
                        Unused dependencies never fail. Policy violations
                        (cargoscope.toml) fail unless THRESHOLD is none.
+  --ignore-unlikely    Do not fail --fail-on for advisories ranked unlikely
+                       (dev-only, mismatched [graph] target, or uncalled function).
   --show-uncertain     Also list possibly-unused dependencies.
   --precise            Confirm unused dependencies with rustc (cargo check, all
                        targets and features). COMPILES THE PROJECT: build
@@ -121,6 +133,7 @@ fn main() -> ExitCode {
         Some("scan") => Some(SCAN_USAGE),
         Some("why") => Some(WHY_USAGE),
         Some("compare") => Some(COMPARE_USAGE),
+        Some("aggregate") => Some(AGGREGATE_USAGE),
         Some("fix") => Some(FIX_USAGE),
         Some("init") => Some(INIT_USAGE),
         Some("update") => Some(UPDATE_USAGE),
@@ -145,6 +158,7 @@ fn main() -> ExitCode {
             }
         },
         Some("compare") => compare::compare_command(rest.into_iter()),
+        Some("aggregate") => aggregate::aggregate_command(rest.into_iter()),
         Some("why") => why::why_command(rest.into_iter()),
         Some("fix") => fix::fix_command(rest.into_iter()),
         Some("init") => init::init_command(rest.into_iter()),
@@ -167,6 +181,7 @@ fn main() -> ExitCode {
                     INIT_USAGE,
                     UPDATE_USAGE,
                     COMPARE_USAGE,
+                    AGGREGATE_USAGE,
                     FIX_USAGE,
                     AUDIT_BIN_USAGE,
                     WHY_USAGE,

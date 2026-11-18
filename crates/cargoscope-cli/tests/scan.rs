@@ -1221,6 +1221,86 @@ fn fix_shows_then_removes_only_likely_unused_dependencies() {
 }
 
 #[test]
+fn fix_only_and_include_uncertain_remove_possibly_unused_and_dep_features() {
+    let dir = std::env::temp_dir().join(format!("cargoscope-fix-uncertain-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    copy_dir(&fixture("unused"), &dir);
+
+    // Explicit --only removes a possibly-unused dependency, but never an ignored one.
+    let only_chrono = fix(&dir, &["--only", "chrono,once_cell", "--apply"]);
+    assert_eq!(only_chrono.status.code(), Some(0));
+    let only_text = stdout(&only_chrono);
+    assert!(
+        only_text.contains("  - remove `chrono` from [dependencies]\n"),
+        "{only_text}"
+    );
+    assert!(
+        only_text.contains("`once_cell` is not a likely-unused dependency: left alone."),
+        "{only_text}"
+    );
+    let edited = std::fs::read_to_string(dir.join("Cargo.toml")).expect("manifest");
+    assert!(!edited.contains("chrono"), "{edited}");
+    assert!(edited.contains("openssl-sys"), "{edited}");
+    assert!(edited.contains("once_cell"), "{edited}");
+
+    // --include-uncertain removes both likely-unused and remaining possibly-unused crates.
+    let uncertain = fix(&dir, &["--include-uncertain", "--apply"]);
+    assert_eq!(uncertain.status.code(), Some(0));
+    let edited = std::fs::read_to_string(dir.join("Cargo.toml")).expect("manifest");
+    for removed in [
+        "log = ",
+        "openssl-sys = ",
+        "idna = ",
+        "pretty_assertions = ",
+        "pkg-config = ",
+    ] {
+        assert!(!edited.contains(removed), "{removed} still in:\n{edited}");
+    }
+    assert!(edited.contains("once_cell = \"1\""), "{edited}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Optional dependency wired only with `dep:` is likely-unused and cleanly removed.
+    let dep_dir = std::env::temp_dir().join(format!("cargoscope-fix-dep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dep_dir);
+    std::fs::create_dir_all(dep_dir.join("src")).expect("dirs");
+    std::fs::write(
+        dep_dir.join("Cargo.toml"),
+        "[package]\nname = \"opt-dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nchrono = { version = \"0.4\", optional = true }\n\n[features]\ndates = [\"dep:chrono\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dep_dir.join("src/lib.rs"), "pub fn ok() {}\n").expect("lib");
+    let registry = "source = \"registry+https://github.com/rust-lang/crates.io-index\"";
+    std::fs::write(
+        dep_dir.join("Cargo.lock"),
+        format!(
+            "version = 4\n\n[[package]]\nname = \"opt-dep\"\nversion = \"0.1.0\"\ndependencies = [\"chrono\"]\n\n[[package]]\nname = \"chrono\"\nversion = \"0.4.39\"\n{registry}\n"
+        ),
+    )
+    .expect("lock");
+
+    let scan_out = Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+        .env("CARGOSCOPE_CACHE_DIR", fixture("advisory-cache"))
+        .env("CARGO_HOME", fixture("empty-cargo-home"))
+        .args(["scan", "--checks", "inventory,unused", "--fail-on", "none"])
+        .arg(&dep_dir)
+        .output()
+        .expect("scan runs");
+    assert_eq!(scan_out.status.code(), Some(0));
+    let scan_text = stdout(&scan_out);
+    assert!(
+        scan_text.contains("- chrono [likely-unused] in [dependencies] of Cargo.toml"),
+        "{scan_text}"
+    );
+
+    let applied = fix(&dep_dir, &["--apply"]);
+    assert_eq!(applied.status.code(), Some(0));
+    let cleaned = std::fs::read_to_string(dep_dir.join("Cargo.toml")).expect("cleaned");
+    assert!(!cleaned.contains("chrono"), "{cleaned}");
+    assert!(cleaned.contains("dates = []"), "{cleaned}");
+    let _ = std::fs::remove_dir_all(&dep_dir);
+}
+
+#[test]
 fn fix_removes_workspace_dependencies_no_member_uses_anymore_and_honours_only() {
     let dir = std::env::temp_dir().join(format!("cargoscope-fix-ws-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1348,6 +1428,7 @@ fn every_subcommand_has_its_own_help() {
         ("fix", "--only NAMES", "--show-uncertain"),
         ("init", "--ci", "cargoscope compare"),
         ("compare", "--format text|json|markdown", "cargoscope scan"),
+        ("aggregate", "--format text|json|html", "cargoscope scan"),
         (
             "update",
             "The only command that uses the network",
@@ -1430,6 +1511,44 @@ fn audit_bin_reads_cargo_auditable_data_and_falls_back_to_registry_paths() {
         serde_json::from_slice(&audit_bin("auditable.bin", &["--format", "json"]).stdout)
             .expect("valid JSON");
     assert_eq!(json["advisories"][0]["id"], "CARGOSCOPE-TEST-0001");
+
+    let sarif: serde_json::Value =
+        serde_json::from_slice(&audit_bin("auditable.bin", &["--format", "sarif"]).stdout)
+            .expect("valid SARIF");
+    assert_eq!(sarif["version"], "2.1.0");
+    assert_eq!(
+        sarif["runs"][0]["results"][0]["ruleId"],
+        "CARGOSCOPE-TEST-0001"
+    );
+
+    let cdx: serde_json::Value =
+        serde_json::from_slice(&audit_bin("auditable.bin", &["--format", "cyclonedx"]).stdout)
+            .expect("valid CycloneDX");
+    assert_eq!(cdx["bomFormat"], "CycloneDX");
+    assert_eq!(cdx["vulnerabilities"][0]["id"], "CARGOSCOPE-TEST-0001");
+
+    let html_file =
+        std::env::temp_dir().join(format!("cargoscope-audit-bin-{}.html", std::process::id()));
+    let html_out = audit_bin(
+        "auditable.bin",
+        &[
+            "--format",
+            "html",
+            "--fail-on",
+            "none",
+            "--output",
+            html_file.to_str().expect("utf-8"),
+        ],
+    );
+    assert_eq!(html_out.status.code(), Some(0));
+    let html = std::fs::read_to_string(&html_file).expect("html file written");
+    assert!(html.contains("CARGOSCOPE-TEST-0001"), "{html}");
+    let _ = std::fs::remove_file(&html_file);
+
+    let colored = stdout(&audit_bin("auditable.bin", &["--color", "always"]));
+    assert!(colored.contains("\u{1b}["), "{colored}");
+    let plain = stdout(&audit_bin("auditable.bin", &["--color", "never"]));
+    assert!(!plain.contains("\u{1b}["), "{plain}");
 
     let partial = audit_bin("paths.bin", &["--fail-on", "none", "--verbose"]);
     assert_eq!(partial.status.code(), Some(0));
@@ -2316,7 +2435,7 @@ ignore = [{ id = "RUSTSEC-2020-0071", reason = "from deny" }]
     assert!(dir.join("cargoscope.toml").is_file());
     let workflow = std::fs::read_to_string(dir.join(".github/workflows/cargoscope.yml"))
         .expect("workflow written");
-    assert!(workflow.contains("HarpeLm/CargoScope@v0.7.6"));
+    assert!(workflow.contains("HarpeLm/CargoScope@v0.8.0"));
 
     // Refuses to overwrite without --force, overwrites with --force.
     let second = run(&[]);
@@ -2506,7 +2625,7 @@ fn ranks_advisories_by_dev_platform_and_uncalled_functions() {
         "{vuln_section}"
     );
 
-    // 2. Verbose + HTML with [graph]: unbuilt crate detection and configured target mismatch.
+    // 2. Standalone [graph] (no policy table), --ignore-unlikely, SARIF, CycloneDX VEX, and compare.
     std::fs::write(
         adv_db.join("crates/serde_json/CARGOSCOPE-REL-0005.md"),
         "```toml\n[advisory]\nid = \"CARGOSCOPE-REL-0005\"\npackage = \"serde_json\"\ndate = \"2025-01-05\"\ncvss = \"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L\"\n\n[versions]\npatched = [\">= 2.0.0\"]\n\n[affected]\nos = [\"plan9\"]\n```\n\n# Configured target mismatch\n",
@@ -2514,7 +2633,7 @@ fn ranks_advisories_by_dev_platform_and_uncalled_functions() {
     .expect("adv 5");
     std::fs::write(
         dir.join("cargoscope.toml"),
-        "[graph]\ntargets = [\"x86_64-unknown-linux-gnu\"]\n\n[bans]\n",
+        "[graph]\ntargets = [\"x86_64-unknown-linux-gnu\"]\n",
     )
     .expect("write cargoscope.toml");
     let fake_cargo = compile_fake_cargo_tree(
@@ -2529,14 +2648,20 @@ fn ranks_advisories_by_dev_platform_and_uncalled_functions() {
             "scan",
             "--verbose",
             "--checks",
-            "inventory,advisories,policy",
+            "inventory,advisories",
             "--fail-on",
-            "none",
+            "high",
+            "--ignore-unlikely",
         ])
         .arg(&dir)
         .output()
         .expect("cargoscope verbose scan");
-    assert_eq!(text_out.status.code(), Some(0));
+    assert_eq!(
+        text_out.status.code(),
+        Some(0),
+        "only high advisory is unlikely, so --ignore-unlikely passes: {}",
+        stdout(&text_out)
+    );
     let text = stdout(&text_out);
     assert!(
         text.contains("relevance: unlikely (`from_reader()` is never called in project sources)"),
@@ -2555,6 +2680,126 @@ fn ranks_advisories_by_dev_platform_and_uncalled_functions() {
         "{text}"
     );
 
+    let sarif_out = Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+        .env("CARGOSCOPE_CACHE_DIR", &cache)
+        .env("CARGO_HOME", fixture("empty-cargo-home"))
+        .env("CARGO", &fake_cargo)
+        .args([
+            "scan",
+            "--checks",
+            "inventory,advisories",
+            "--format",
+            "sarif",
+            "--fail-on",
+            "none",
+        ])
+        .arg(&dir)
+        .output()
+        .expect("cargoscope sarif scan");
+    assert_eq!(sarif_out.status.code(), Some(0));
+    let sarif: serde_json::Value =
+        serde_json::from_slice(&sarif_out.stdout).expect("valid SARIF JSON");
+    let sarif_results = sarif["runs"][0]["results"].as_array().expect("results");
+    let sarif_0002 = sarif_results
+        .iter()
+        .find(|item| item["ruleId"] == "CARGOSCOPE-REL-0002")
+        .expect("REL-0002 in SARIF");
+    assert_eq!(sarif_0002["properties"]["relevance"], "unlikely");
+    assert!(
+        sarif_0002["message"]["text"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("Relevance: unlikely (`from_reader()`")),
+        "{sarif_0002}"
+    );
+
+    let cdx_out = Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+        .env("CARGOSCOPE_CACHE_DIR", &cache)
+        .env("CARGO_HOME", fixture("empty-cargo-home"))
+        .env("CARGO", &fake_cargo)
+        .args([
+            "scan",
+            "--checks",
+            "inventory,advisories",
+            "--format",
+            "cyclonedx",
+            "--fail-on",
+            "none",
+        ])
+        .arg(&dir)
+        .output()
+        .expect("cargoscope cyclonedx scan");
+    assert_eq!(cdx_out.status.code(), Some(0));
+    let cdx: serde_json::Value =
+        serde_json::from_slice(&cdx_out.stdout).expect("valid CycloneDX JSON");
+    let vulns = cdx["vulnerabilities"].as_array().expect("vulnerabilities");
+    let cdx_0002 = vulns
+        .iter()
+        .find(|item| item["id"] == "CARGOSCOPE-REL-0002")
+        .expect("REL-0002 in CycloneDX");
+    assert_eq!(cdx_0002["analysis"]["state"], "not_affected");
+    assert_eq!(cdx_0002["analysis"]["justification"], "code_not_reachable");
+    let cdx_0003 = vulns
+        .iter()
+        .find(|item| item["id"] == "CARGOSCOPE-REL-0003")
+        .expect("REL-0003 in CycloneDX");
+    assert_eq!(cdx_0003["analysis"]["state"], "not_affected");
+    assert_eq!(cdx_0003["analysis"]["justification"], "code_not_present");
+
+    // 3. [advisories] ignore-unlikely = true in cargoscope.toml + cargoscope compare --ignore-unlikely.
+    let report_json_path = dir.join("current.json");
+    let empty_baseline_path = dir.join("baseline.json");
+    std::fs::write(
+        &empty_baseline_path,
+        "{\"format_version\":1,\"advisories\":[],\"packages\":[],\"unused\":[]}\n",
+    )
+    .expect("write baseline");
+    std::fs::write(
+        dir.join("cargoscope.toml"),
+        "[graph]\ntargets = [\"x86_64-unknown-linux-gnu\"]\n\n[advisories]\nignore-unlikely = true\n",
+    )
+    .expect("write ignore-unlikely");
+    let config_out = Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+        .env("CARGOSCOPE_CACHE_DIR", &cache)
+        .env("CARGO_HOME", fixture("empty-cargo-home"))
+        .env("CARGO", &fake_cargo)
+        .args([
+            "scan",
+            "--checks",
+            "inventory,advisories",
+            "--format",
+            "json",
+            "--fail-on",
+            "high",
+            "--output",
+        ])
+        .arg(&report_json_path)
+        .arg(&dir)
+        .output()
+        .expect("cargoscope config ignore-unlikely scan");
+    assert_eq!(config_out.status.code(), Some(0));
+
+    let cmp_fail = compare(&[
+        empty_baseline_path.to_str().expect("utf-8"),
+        report_json_path.to_str().expect("utf-8"),
+        "--fail-on",
+        "high",
+    ]);
+    assert_eq!(cmp_fail.status.code(), Some(1));
+    assert!(
+        stdout(&cmp_fail).contains("(unlikely: only used by dev-dependencies"),
+        "{}",
+        stdout(&cmp_fail)
+    );
+
+    let cmp_pass = compare(&[
+        empty_baseline_path.to_str().expect("utf-8"),
+        report_json_path.to_str().expect("utf-8"),
+        "--fail-on",
+        "high",
+        "--ignore-unlikely",
+    ]);
+    assert_eq!(cmp_pass.status.code(), Some(0));
+
     let html_out = Command::new(env!("CARGO_BIN_EXE_cargoscope"))
         .env("CARGOSCOPE_CACHE_DIR", &cache)
         .env("CARGO_HOME", fixture("empty-cargo-home"))
@@ -2562,7 +2807,7 @@ fn ranks_advisories_by_dev_platform_and_uncalled_functions() {
         .args([
             "scan",
             "--checks",
-            "inventory,advisories,policy",
+            "inventory,advisories",
             "--format",
             "html",
             "--fail-on",
@@ -2578,6 +2823,276 @@ fn ranks_advisories_by_dev_platform_and_uncalled_functions() {
         html.contains("only used by dev-dependencies (tests or benchmarks)"),
         "{html}"
     );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn color_flag_styles_why_fix_and_compare_only_when_enabled() {
+    let dir = std::env::temp_dir().join(format!("cargoscope-color-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+
+    // 1. why --color always vs --color never
+    let why_project = fixture("multi-version");
+    let why_colored = stdout(
+        &Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+            .args([
+                "why",
+                "bitflags",
+                why_project.to_str().expect("utf-8"),
+                "--color",
+                "always",
+            ])
+            .output()
+            .expect("why always"),
+    );
+    let why_plain = stdout(
+        &Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+            .args([
+                "why",
+                "bitflags",
+                why_project.to_str().expect("utf-8"),
+                "--color",
+                "never",
+            ])
+            .output()
+            .expect("why never"),
+    );
+    assert!(why_colored.contains("\u{1b}["), "{why_colored}");
+    assert!(!why_plain.contains("\u{1b}["), "{why_plain}");
+
+    // 2. fix --color always vs --color never (unused, --advisories, --updates)
+    let fix_colored = stdout(&fix(&fixture("unused"), &["--color", "always"]));
+    let fix_plain = stdout(&fix(&fixture("unused"), &["--color", "never"]));
+    assert!(fix_colored.contains("\u{1b}["), "{fix_colored}");
+    assert!(!fix_plain.contains("\u{1b}["), "{fix_plain}");
+
+    let fake_src = dir.join("fake_cargo_update.rs");
+    let fake_cargo = dir.join(format!("fake-cargo-update{}", std::env::consts::EXE_SUFFIX));
+    std::fs::write(&fake_src, "fn main() {}\n").expect("write fake cargo");
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    assert!(
+        Command::new(rustc)
+            .arg(&fake_src)
+            .arg("-o")
+            .arg(&fake_cargo)
+            .status()
+            .expect("rustc runs")
+            .success()
+    );
+    let adv_dir = dir.join("adv-proj");
+    copy_dir(&fixture("simple"), &adv_dir);
+    let fix_adv_colored = stdout(
+        &Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+            .env("CARGOSCOPE_CACHE_DIR", fixture("advisory-cache"))
+            .env("CARGO_HOME", fixture("empty-cargo-home"))
+            .env("CARGO", &fake_cargo)
+            .args(["fix", "--advisories", "--color", "always"])
+            .arg(&adv_dir)
+            .output()
+            .expect("fix advisories always"),
+    );
+    let fix_adv_plain = stdout(
+        &Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+            .env("CARGOSCOPE_CACHE_DIR", fixture("advisory-cache"))
+            .env("CARGO_HOME", fixture("empty-cargo-home"))
+            .env("CARGO", &fake_cargo)
+            .args(["fix", "--advisories", "--color", "never"])
+            .arg(&adv_dir)
+            .output()
+            .expect("fix advisories never"),
+    );
+    assert!(fix_adv_colored.contains("\u{1b}["), "{fix_adv_colored}");
+    assert!(!fix_adv_plain.contains("\u{1b}["), "{fix_adv_plain}");
+
+    let fix_upd_colored = stdout(
+        &Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+            .env("CARGOSCOPE_CACHE_DIR", fixture("advisory-cache"))
+            .env("CARGO_HOME", fixture("empty-cargo-home"))
+            .env("CARGO", &fake_cargo)
+            .args(["fix", "--updates", "--color", "always"])
+            .arg(&adv_dir)
+            .output()
+            .expect("fix updates always"),
+    );
+    let fix_upd_plain = stdout(
+        &Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+            .env("CARGOSCOPE_CACHE_DIR", fixture("advisory-cache"))
+            .env("CARGO_HOME", fixture("empty-cargo-home"))
+            .env("CARGO", &fake_cargo)
+            .args(["fix", "--updates", "--color", "never"])
+            .arg(&adv_dir)
+            .output()
+            .expect("fix updates never"),
+    );
+    assert!(fix_upd_colored.contains("\u{1b}["), "{fix_upd_colored}");
+    assert!(!fix_upd_plain.contains("\u{1b}["), "{fix_upd_plain}");
+
+    // 3. compare --color always vs --color never
+    let baseline = write_report("color-base", "workspace");
+    let current = write_report("color-curr", "simple");
+    let cmp_colored = stdout(&compare(&[
+        baseline.to_str().expect("utf-8"),
+        current.to_str().expect("utf-8"),
+        "--color",
+        "always",
+    ]));
+    let cmp_plain = stdout(&compare(&[
+        baseline.to_str().expect("utf-8"),
+        current.to_str().expect("utf-8"),
+        "--color",
+        "never",
+    ]));
+    assert!(cmp_colored.contains("\u{1b}["), "{cmp_colored}");
+    assert!(!cmp_plain.contains("\u{1b}["), "{cmp_plain}");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn aggregate_merges_reports_across_projects_in_text_json_and_html() {
+    let report_a = write_report("agg-simple", "simple");
+    let report_b = write_report("agg-unused", "unused");
+    let out_html = std::env::temp_dir().join(format!("cargoscope-agg-{}.html", std::process::id()));
+    let _ = std::fs::remove_file(&out_html);
+
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+            .arg("aggregate")
+            .args(args)
+            .output()
+            .expect("cargoscope aggregate runs")
+    };
+
+    let text_out = run(&[
+        report_a.to_str().expect("utf-8"),
+        report_b.to_str().expect("utf-8"),
+        "--fail-on",
+        "high",
+    ]);
+    assert_eq!(text_out.status.code(), Some(1));
+    let text = stdout(&text_out);
+    assert!(text.contains("CargoScope aggregate (2 projects)"), "{text}");
+    assert!(text.contains("CARGOSCOPE-TEST-0001"), "{text}");
+    assert!(text.contains("Likely-unused dependencies: 5"), "{text}");
+
+    let json_out = run(&[
+        report_a.to_str().expect("utf-8"),
+        report_b.to_str().expect("utf-8"),
+        "--format",
+        "json",
+        "--fail-on",
+        "none",
+    ]);
+    assert_eq!(json_out.status.code(), Some(0));
+    let parsed: serde_json::Value = serde_json::from_slice(&json_out.stdout).expect("valid JSON");
+    assert_eq!(parsed["aggregate_format_version"], 1);
+    assert_eq!(parsed["projects"].as_array().expect("projects").len(), 2);
+    assert!(
+        parsed["advisories"]
+            .as_array()
+            .expect("advisories")
+            .iter()
+            .any(|item| item["id"] == "CARGOSCOPE-TEST-0001"
+                && item["projects"].as_array().expect("proj list").len() == 2)
+    );
+
+    let html_out = run(&[
+        report_a.to_str().expect("utf-8"),
+        report_b.to_str().expect("utf-8"),
+        "--format",
+        "html",
+        "--fail-on",
+        "none",
+        "--output",
+        out_html.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(html_out.status.code(), Some(0));
+    let html = std::fs::read_to_string(&out_html).expect("html file written");
+    assert!(html.contains("CargoScope Aggregate Report"), "{html}");
+    assert!(html.contains("CARGOSCOPE-TEST-0001"), "{html}");
+    let _ = std::fs::remove_file(&out_html);
+    let _ = std::fs::remove_file(&report_a);
+    let _ = std::fs::remove_file(&report_b);
+}
+
+#[test]
+fn comment_commands_parse_pr_body_and_update_ignore_rules() {
+    let dir = std::env::temp_dir().join(format!("cargoscope-pr-cmd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    copy_dir(&fixture("simple"), &dir);
+
+    let pr_body = dir.join("pr-body.md");
+    std::fs::write(
+        &pr_body,
+        "<!-- cargoscope-update-pr -->\n| Package | Version | Update | Published | Checks | Links |\n|---|---|---|---|---|---|\n| [`serde_json`](https://crates.io/crates/serde_json/1.0.200) | 1.0.128 → **1.0.200** | minor | 2026-11-01 | ✅ no issue found | [diff](https://diff.rs/serde_json/1.0.128/1.0.200) |\n",
+    )
+    .expect("write pr body");
+
+    let dry_ignore = Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+        .args([
+            "fix",
+            "--updates",
+            "--comment-command",
+            "/cargoscope ignore this version",
+            "--pr-body",
+            pr_body.to_str().expect("utf-8"),
+        ])
+        .arg(&dir)
+        .output()
+        .expect("comment dry run");
+    assert_eq!(dry_ignore.status.code(), Some(0));
+    assert!(!dir.join("cargoscope.toml").exists());
+    let dry_json: serde_json::Value =
+        serde_json::from_slice(&dry_ignore.stdout).expect("valid JSON");
+    assert_eq!(dry_json["command"], "ignore");
+    assert_eq!(dry_json["modified"], true);
+    assert_eq!(dry_json["packages"], serde_json::json!(["serde_json"]));
+
+    let apply_ignore = Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+        .args([
+            "fix",
+            "--updates",
+            "--apply",
+            "--comment-command",
+            "@cargoscope ignore this version",
+            "--pr-body",
+            pr_body.to_str().expect("utf-8"),
+        ])
+        .arg(&dir)
+        .output()
+        .expect("comment apply ignore");
+    assert_eq!(apply_ignore.status.code(), Some(0));
+    let config =
+        std::fs::read_to_string(dir.join("cargoscope.toml")).expect("cargoscope.toml written");
+    assert!(config.contains("[updates]"), "{config}");
+    assert!(
+        config.contains("name = \"serde_json\", versions = [\"1.0.200\"]"),
+        "{config}"
+    );
+    assert!(
+        cargoscope_cargo::updates::from_toml(&config).is_ok(),
+        "{config}"
+    );
+
+    let rebase = Command::new(env!("CARGO_BIN_EXE_cargoscope"))
+        .args([
+            "fix",
+            "--updates",
+            "--comment-command",
+            "/cargoscope rebase",
+            "--pr-body",
+            pr_body.to_str().expect("utf-8"),
+        ])
+        .arg(&dir)
+        .output()
+        .expect("comment rebase");
+    assert_eq!(rebase.status.code(), Some(0));
+    let rebase_json: serde_json::Value =
+        serde_json::from_slice(&rebase.stdout).expect("valid JSON");
+    assert_eq!(rebase_json["command"], "rebase");
+    assert_eq!(rebase_json["packages"], serde_json::json!(["serde_json"]));
 
     let _ = std::fs::remove_dir_all(dir);
 }
