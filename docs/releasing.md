@@ -10,6 +10,7 @@ A release is started by pushing a version tag. Everything else runs in GitHub Ac
 | npm (`npx cargoscope`) | `release.yml` | `NPM_TOKEN` secret |
 | PyPI (`pip install cargoscope`, `uvx cargoscope`) | `pypi.yml`, **not enabled yet** | PyPI trusted publisher (no token), then restore the tag trigger in `pypi.yml` |
 | GitHub Action (`uses: HarpeLm/CargoScope@v0.7.0`) | `action.yml` at the repository root | The GitHub Release |
+| Container images (`ghcr.io/harpelm/cargoscope`) | `docker/Dockerfile`, `.github/workflows/docker.yml` | The Docker workflow, once Release succeeds (or by hand with a tag) |
 
 ## v0.1.0 checklist
 
@@ -132,6 +133,13 @@ Released on 2026-11-17: two `fix --advisories --apply` fixes found while prepari
 Released on 2026-11-17: two unused-dependency false positives found while preparing eval-exec/neomacs#811. Source files' `#[path]` modules and `include!` are followed into the rest of the workspace (neomacs's xtask reuses `neovm-core/build_support/`), and a dev-dependency turning on a test feature of a workspace crate the package also reaches is possibly-unused (`neovm-eval` with `test-support`). Snapshot of 223 repositories: no change on the 70 labelled applications or the 73 libraries.
 
 - ✅ Tag `v0.7.5` pushed (2026-11-17) after CI passed on `main`; `cargo package` verified the 5 crates. GitHub Release (20 assets), crates.io (5 crates), npm, Homebrew and the installer report 0.7.5.
+- ✅ Set the version back to `0.8.0-dev`.
+
+## v0.7.6
+
+Prepared on 2026-11-18: `cargoscope update --fast` / `--no-maintenance`, `cargoscope scan --update [--fast]`, `cargoscope init` (`--ci`, `--policy`, `--dry-run`, `--force`, migrating `deny.toml` and `.cargo/audit.toml`), non-blocking SARIF upload in `action.yml`, extracted `CHANGELOG.md` and refreshed `README.md` / `docs/try-it.md`.
+
+- ✅ `cargo fmt`, `clippy -D warnings`, `cargo test --workspace`; `cargo clean` then `cargo package --workspace --exclude cargoscope-corpus`: the 5 crates verify; `dist plan` ok. Tag `v0.7.6` pushed (2026-11-18).
 - ✅ Set the version back to `0.8.0-dev`.
 
 ## One-time setup (maintainer)
