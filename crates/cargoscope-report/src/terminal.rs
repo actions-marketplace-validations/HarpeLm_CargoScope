@@ -398,6 +398,7 @@ pub(crate) fn render_hud(project_root: &Path, report: &Report, options: TextOpti
     }
     if report.checks.versions {
         showed_any_section |= hud_yanked(&mut out, report, width, paint);
+        showed_any_section |= hud_recent(&mut out, report, options.now, width, paint);
     }
     if report.checks.unused {
         showed_any_section |= hud_unused(&mut out, report, options.show_uncertain, width, paint);
@@ -406,6 +407,8 @@ pub(crate) fn render_hud(project_root: &Path, report: &Report, options: TextOpti
         showed_any_section |= hud_outdated(&mut out, report, width, paint);
         showed_any_section |= hud_maintenance(&mut out, report, width, paint);
     }
+    showed_any_section |= hud_unsafe(&mut out, report, width, paint);
+    showed_any_section |= hud_audits(&mut out, report, width, paint);
     showed_any_section |= hud_weights(&mut out, report, width, paint);
     showed_any_section |= hud_duplicates(&mut out, report, width, paint);
     if report.checks.licenses {
@@ -1109,6 +1112,50 @@ fn hud_yanked(out: &mut String, report: &Report, width: usize, paint: Paint) -> 
     true
 }
 
+fn hud_recent(
+    out: &mut String,
+    report: &Report,
+    now: Option<u64>,
+    width: usize,
+    paint: Paint,
+) -> bool {
+    let rows = crate::recent_releases(report, now);
+    if rows.is_empty() {
+        return false;
+    }
+    let sub = format!(
+        "{} in the last {} h · review them before trusting",
+        plural(rows.len(), "release"),
+        cargoscope_core::RECENT_RELEASE_HOURS
+    );
+    section_rule(out, "RECENT RELEASES", Some(&sub), width, paint);
+    for &(index, hours) in rows.iter().take(5) {
+        let package = &report.inventory.packages[index];
+        let chain_note = short_chain(report, index)
+            .map(|c| format!("  {}", paint.dim(&format!("← {c}"))))
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "  {} {} {}  {}{chain_note}",
+            paint.yellow("◷"),
+            paint.bold(&package.name),
+            paint.dim(&package.version),
+            paint.yellow(&crate::describe_age(hours))
+        );
+    }
+    if rows.len() > 5 {
+        let _ = writeln!(
+            out,
+            "  {}",
+            paint.dim(&format!(
+                "+ {} more — use --verbose for all",
+                rows.len() - 5
+            ))
+        );
+    }
+    true
+}
+
 fn hud_unused(
     out: &mut String,
     report: &Report,
@@ -1388,6 +1435,126 @@ fn mass_bar(value: usize, max_value: usize, is_top: bool, paint: Paint) -> Strin
         paint.scope(&fill_str)
     };
     format!("{colored_fill}{}", paint.dim(&empty_str))
+}
+
+fn hud_unsafe(out: &mut String, report: &Report, width: usize, paint: Paint) -> bool {
+    // Direct dependencies: the ones the project chose. Transitive ones,
+    // generated bindings included, are listed with --verbose.
+    let (all_rows, _) = crate::unsafe_rows(report);
+    let rows: Vec<_> = all_rows
+        .iter()
+        .filter(|(index, _)| report.inventory.packages[*index].direct)
+        .copied()
+        .collect();
+    if rows.is_empty() {
+        return false;
+    }
+    let direct_counted = report
+        .unsafe_code
+        .iter()
+        .zip(&report.inventory.packages)
+        .filter(|(count, package)| count.is_some() && package.direct)
+        .count();
+    let sub = format!(
+        "{} of {} direct dependencies · {} crates in all",
+        rows.len(),
+        direct_counted,
+        all_rows.len()
+    );
+    section_rule(out, "UNSAFE CODE", Some(&sub), width, paint);
+    let shown = rows.len().min(5);
+    let slice = &rows[..shown];
+    let most = slice.first().map_or(1, |(_, count)| count.total());
+    let label_w = slice
+        .iter()
+        .map(|(index, _)| {
+            let pkg = &report.inventory.packages[*index];
+            pkg.name.len() + 1 + pkg.version.len()
+        })
+        .max()
+        .unwrap_or(0);
+    let total_w = slice
+        .iter()
+        .map(|(_, count)| count.total().to_string().len())
+        .max()
+        .unwrap_or(1);
+    for (pos, (index, count)) in slice.iter().enumerate() {
+        let pkg = &report.inventory.packages[*index];
+        let bar = mass_bar(count.total(), most, pos == 0, paint);
+        let _ = writeln!(
+            out,
+            "  {} {}{}  {bar}  {}  {}",
+            paint.bold(&pkg.name),
+            paint.dim(&pkg.version),
+            " ".repeat(label_w.saturating_sub(pkg.name.len() + 1 + pkg.version.len())),
+            paint.bold(&format!("{:>total_w$}", count.total())),
+            paint.dim(&crate::describe_unsafe(count))
+        );
+    }
+    if rows.len() > shown {
+        let _ = writeln!(
+            out,
+            "  {}",
+            paint.dim(&format!(
+                "+ {} more — use --verbose for all",
+                rows.len() - shown
+            ))
+        );
+    }
+    true
+}
+
+fn hud_audits(out: &mut String, report: &Report, width: usize, paint: Paint) -> bool {
+    let Some(coverage) = crate::audit_coverage(report) else {
+        return false;
+    };
+    let sub = if coverage.organisations.is_empty() {
+        "cargo-vet".to_owned()
+    } else {
+        format!("cargo-vet · {}", coverage.organisations.join(", "))
+    };
+    section_rule(out, "AUDITS", Some(&sub), width, paint);
+    let _ = writeln!(
+        out,
+        "  {} {} of {} crates.io packages reviewed by an organisation  {}",
+        paint.green("✔"),
+        paint.bold(&coverage.audited.to_string()),
+        coverage.counted,
+        paint.dim(&format!("{} safe-to-deploy", coverage.deploy))
+    );
+    if !coverage.direct_unaudited.is_empty() {
+        let names: Vec<&str> = coverage
+            .direct_unaudited
+            .iter()
+            .map(|&index| report.inventory.packages[index].name.as_str())
+            .collect();
+        let prefix = "  ◇ no audit of the version in use: ";
+        let room = width.saturating_sub(prefix.chars().count() + 6);
+        let mut shown: Vec<&str> = Vec::new();
+        let mut used = 0;
+        for name in &names {
+            let needed = used + usize::from(!shown.is_empty()) * 2 + name.chars().count();
+            if needed > room && !shown.is_empty() {
+                break;
+            }
+            used = needed;
+            shown.push(name);
+        }
+        let more = names.len() - shown.len();
+        let _ = writeln!(
+            out,
+            "  {} {}{}{}",
+            paint.yellow("◇"),
+            paint.dim("no audit of the version in use: "),
+            shown.join(", "),
+            if more > 0 {
+                format!(" {}", paint.dim(&format!("+{more}")))
+            } else {
+                String::new()
+            }
+        );
+    }
+    true
 }
 
 fn hud_weights(out: &mut String, report: &Report, width: usize, paint: Paint) -> bool {

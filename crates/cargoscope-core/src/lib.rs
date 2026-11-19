@@ -577,6 +577,11 @@ pub struct PackageInfo {
     pub latest_compatible: Option<String>,
     /// Publication date (`YYYY-MM-DD`) of `latest_compatible`, when known.
     pub compatible_published: Option<String>,
+    /// Publication time of the resolved version (RFC 3339, UTC), when known.
+    pub published: Option<String>,
+    /// Published cargo-vet audits of the resolved version, best first;
+    /// `None` when no audits were downloaded.
+    pub audits: Option<Vec<Audit>>,
     /// Whether the resolved version has been yanked. `None` when unknown.
     pub yanked: Option<bool>,
     /// Whether `latest_version` is newer than the resolved version.
@@ -601,6 +606,48 @@ pub struct PackageInfo {
 fn is_shared_account(login: &str) -> bool {
     login.contains(':') || login == "rust-lang-owner"
 }
+
+/// Unix seconds of an RFC 3339 UTC timestamp (`2026-11-19T08:30:00Z`, with
+/// optional fractional seconds) or of a bare `YYYY-MM-DD` date (midnight).
+#[must_use]
+pub fn unix_seconds(stamp: &str) -> Option<u64> {
+    let number = |range: std::ops::Range<usize>| -> Option<i64> {
+        let text = stamp.get(range)?;
+        text.bytes()
+            .all(|byte| byte.is_ascii_digit())
+            .then(|| text.parse().ok())?
+    };
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    if stamp.get(4..5) != Some("-") || stamp.get(7..8) != Some("-") || !(1..=12).contains(&month) {
+        return None;
+    }
+    let (hour, minute, second) = if stamp.len() == 10 {
+        (0, 0, 0)
+    } else {
+        if !matches!(stamp.get(10..11), Some("T" | " ")) {
+            return None;
+        }
+        let rest = &stamp[19.min(stamp.len())..];
+        let utc = rest.ends_with('Z') || rest.ends_with("+00:00") || rest.is_empty();
+        if !utc {
+            return None;
+        }
+        (number(11..13)?, number(14..16)?, number(17..19)?)
+    };
+    // Days from civil (Howard Hinnant's algorithm), the inverse of `utc_date`.
+    let shifted_year = if month <= 2 { year - 1 } else { year };
+    let era = shifted_year.div_euclid(400);
+    let year_of_era = shifted_year - era * 400;
+    let month_index = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * month_index + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    u64::try_from(days * 86_400 + hour * 3_600 + minute * 60 + second).ok()
+}
+
+/// A resolved version published less than this many hours before the scan
+/// is a recent release: compromised releases are usually caught within days.
+pub const RECENT_RELEASE_HOURS: u64 = 72;
 
 /// A crate without a release for this many years counts as stale.
 pub const STALE_YEARS: u32 = 2;
@@ -798,6 +845,60 @@ impl Default for Checks {
     }
 }
 
+/// The standard cargo-vet criteria an audit certifies, weakest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AuditCriteria {
+    /// Reviewed enough to run in tests and development.
+    SafeToRun,
+    /// Reviewed enough to ship to users.
+    SafeToDeploy,
+}
+
+impl AuditCriteria {
+    /// The cargo-vet name of the criteria.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SafeToRun => "safe-to-run",
+            Self::SafeToDeploy => "safe-to-deploy",
+        }
+    }
+}
+
+/// A published audit of a crate version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Audit {
+    /// The organisation that published it (`mozilla`, `google`…).
+    pub by: String,
+    /// The best standard criteria it certifies.
+    pub criteria: AuditCriteria,
+}
+
+/// How much `unsafe` code a package contains, counted from its sources.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnsafeCount {
+    /// `unsafe { … }` blocks.
+    pub blocks: usize,
+    /// `unsafe fn` items and `unsafe extern` blocks.
+    pub functions: usize,
+    /// `unsafe impl` items.
+    pub impls: usize,
+    /// `unsafe trait` items.
+    pub traits: usize,
+    /// Other uses of the keyword, such as `#[unsafe(no_mangle)]` or inside macros.
+    pub other: usize,
+    /// Source files the lexer could not read, so not counted.
+    pub unreadable_files: usize,
+}
+
+impl UnsafeCount {
+    /// Every use of `unsafe`.
+    #[must_use]
+    pub const fn total(&self) -> usize {
+        self.blocks + self.functions + self.impls + self.traits + self.other
+    }
+}
+
 /// Everything a scan produced, ready to be rendered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
@@ -826,6 +927,9 @@ pub struct Report {
     /// dependency, by crate name (empty when the manifests were not read).
     pub direct_kinds:
         std::collections::BTreeMap<String, std::collections::BTreeSet<DependencyKind>>,
+    /// `unsafe` code of each package, by package index (empty when not
+    /// counted; `None` for packages whose sources are not on disk).
+    pub unsafe_code: Vec<Option<UnsafeCount>>,
 }
 
 #[cfg(test)]

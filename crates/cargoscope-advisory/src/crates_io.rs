@@ -67,12 +67,24 @@ fn is_valid_version(version: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
 }
 
-/// One published version, as stored in the cache: `version \t yanked \t date`.
+/// One published version, as stored in the cache:
+/// `version \t yanked \t publication time` (RFC 3339; a bare date in caches
+/// written by older versions).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PublishedVersion {
     version: String,
     yanked: bool,
     published: Option<String>,
+}
+
+impl PublishedVersion {
+    /// The publication day, `YYYY-MM-DD`.
+    fn date(&self) -> Option<String> {
+        self.published
+            .as_deref()
+            .and_then(|time| time.get(..10))
+            .map(str::to_owned)
+    }
 }
 
 fn parse_index(text: &str) -> Vec<PublishedVersion> {
@@ -89,7 +101,12 @@ fn parse_index(text: &str) -> Vec<PublishedVersion> {
                 published: entry
                     .get("pubtime")
                     .and_then(serde_json::Value::as_str)
-                    .and_then(|time| time.get(..10))
+                    .filter(|time| {
+                        time.len() >= 10
+                            && time.chars().all(|c| {
+                                c.is_ascii_digit() || matches!(c, '-' | ':' | 'T' | 'Z' | '.' | '+')
+                            })
+                    })
                     .map(str::to_owned),
             })
         })
@@ -459,6 +476,7 @@ fn local_license(sources: &[PathBuf], name: &str, version: &str) -> Option<Strin
 #[derive(Debug, Clone)]
 pub struct RegistryCache {
     root: PathBuf,
+    audits: Option<crate::vet::Audits>,
     /// When the data was downloaded, as `YYYY-MM-DD` (UTC), if ever.
     pub fetched_on: Option<String>,
 }
@@ -472,7 +490,20 @@ impl RegistryCache {
             .ok()
             .and_then(|text| text.trim().parse::<u64>().ok())
             .map(utc_date);
-        Self { root, fetched_on }
+        Self {
+            root,
+            audits: crate::vet::Audits::open(cache_dir),
+            fetched_on,
+        }
+    }
+
+    /// Organisations whose published audits are cached, sorted; empty when
+    /// none were downloaded.
+    #[must_use]
+    pub fn audit_organisations(&self) -> &[String] {
+        self.audits
+            .as_ref()
+            .map_or(&[], |audits| audits.organisations.as_slice())
     }
 
     /// Registry data for every package of `inventory`, in the same order.
@@ -509,7 +540,7 @@ impl RegistryCache {
                 let last_release = versions
                     .iter()
                     .filter(|version| !version.yanked)
-                    .filter_map(|version| version.published.clone())
+                    .filter_map(|version| version.date())
                     .max();
                 let stale = match (&last_release, &self.fetched_on) {
                     (Some(release), Some(fetched)) => {
@@ -531,11 +562,19 @@ impl RegistryCache {
                     }
                 });
                 PackageInfo {
+                    audits: self
+                        .audits
+                        .as_ref()
+                        .map(|audits| audits.of(&package.name, &package.version)),
                     license,
                     latest_version: newest.map(|version| version.version.clone()),
-                    latest_published: newest.and_then(|version| version.published.clone()),
+                    latest_published: newest.and_then(PublishedVersion::date),
                     latest_compatible: compat.map(|version| version.version.clone()),
-                    compatible_published: compat.and_then(|version| version.published.clone()),
+                    compatible_published: compat.and_then(PublishedVersion::date),
+                    published: versions
+                        .iter()
+                        .find(|version| version.version == package.version)
+                        .and_then(|version| version.published.clone()),
                     yanked,
                     outdated,
                     last_release,
@@ -595,7 +634,11 @@ not json
 {"name":"x","vers":"../bad","yanked":false}"#;
         let versions = parse_index(index);
         assert_eq!(versions.len(), 2);
-        assert_eq!(versions[0].published.as_deref(), Some("2024-03-04"));
+        assert_eq!(
+            versions[0].published.as_deref(),
+            Some("2024-03-04T05:06:07Z")
+        );
+        assert_eq!(versions[0].date().as_deref(), Some("2024-03-04"));
         assert!(versions[1].yanked);
         assert_eq!(read_versions(&format_versions(&versions)), versions);
     }

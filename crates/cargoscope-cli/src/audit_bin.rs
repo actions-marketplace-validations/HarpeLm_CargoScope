@@ -133,6 +133,7 @@ fn audit(
         advisory_db_date: database.fetched_on.clone(),
         warnings,
         direct_kinds: std::collections::BTreeMap::new(),
+        unsafe_code: Vec::new(),
     };
     let rendered = match options.format {
         OutputFormat::Text => cargoscope_report::render_text(
@@ -156,7 +157,7 @@ fn audit(
             false,
         ),
         OutputFormat::CycloneDx => cargoscope_report::cyclonedx::render_cyclonedx(file, &report),
-        OutputFormat::Html => cargoscope_report::html::render_html(file, &report, false),
+        OutputFormat::Html => cargoscope_report::html::render_html(file, &report, false, None),
     };
     match &options.output {
         Some(path) => std::fs::write(path, rendered).map_err(|error| error.to_string())?,
