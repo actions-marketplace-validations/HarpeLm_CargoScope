@@ -76,7 +76,7 @@ const FIX_USAGE: &str =
       `/cargoscope rebase` or `/cargoscope ignore this major version`.
       Needs the crates.io data of `cargoscope update`; compiles nothing.";
 
-const SCAN_USAGE: &str = "  cargoscope scan [PATH] [--update] [--no-maintenance | --fast] [--format text|json|sarif|cyclonedx|html] [--output FILE] [--fail-on THRESHOLD] [--ignore-unlikely] [--show-uncertain] [--verbose] [--precise] [--color WHEN]
+const SCAN_USAGE: &str = "  cargoscope scan [PATH] [--update] [--no-maintenance | --fast] [--format text|json|sarif|cyclonedx|html] [--output FILE] [--fail-on THRESHOLD] [--ignore-unlikely] [--rustsec-only] [--show-uncertain] [--verbose] [--precise] [--color WHEN]
       Report on a Cargo project, read-only and offline (unless --update is given).
 
 Options for scan:
@@ -96,6 +96,8 @@ Options for scan:
                        (cargoscope.toml) fail unless THRESHOLD is none.
   --ignore-unlikely    Do not fail --fail-on for advisories ranked unlikely
                        (dev-only, mismatched [graph] target, or uncalled function).
+  --rustsec-only       Report RustSec advisories only, as cargo-audit does, without
+                       the GitHub and malicious-crate advisories that OSV adds.
   --show-uncertain     Also list possibly-unused dependencies.
   --precise            Confirm unused dependencies with rustc (cargo check, all
                        targets and features). COMPILES THE PROJECT: build
@@ -342,6 +344,16 @@ fn run_update(
             return Err(ExitCode::from(2));
         }
     }
+    // OSV adds what RustSec lacks; without it, scans still have RustSec.
+    match cargoscope_advisory::osv::update(&cache, cargoscope_advisory::osv::DEFAULT_OSV_URL) {
+        Ok(summary) => say(&format!(
+            "OSV advisories not in RustSec updated: {} (GitHub advisories and malicious crates)",
+            summary.advisories
+        )),
+        Err(error) => eprintln!(
+            "warning: OSV advisories not updated ({error}); scans use RustSec alone until the next update"
+        ),
+    }
 
     let loaded_inventory;
     let inventory = match inventory {
@@ -382,12 +394,30 @@ fn run_update(
             "Maintenance data of {direct} direct dependencies: up to {direct} s the first time (crates.io asks for one request per second; use --fast to skip), then kept for a week."
         ));
     }
-    match crates_io::refresh_with_options(
+    // A live counter on a terminal; nothing in pipes and CI logs.
+    let live = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let mut shown = false;
+    let mut progress = |event: crates_io::RefreshProgress| {
+        let crates_io::RefreshProgress::Maintenance { done, total } = event;
+        if !live {
+            return;
+        }
+        if done < total {
+            eprint!("\r\x1b[2KMaintenance data: {done}/{total} direct dependencies...");
+            shown = true;
+        } else if shown {
+            eprint!("\r\x1b[2K");
+        }
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    };
+    let refreshed = crates_io::refresh_with_progress(
         &cache,
         inventory,
         cargo_home.as_deref(),
         include_maintenance,
-    ) {
+        &mut progress,
+    );
+    match refreshed {
         Ok(summary) => {
             if include_maintenance {
                 say(&format!(
@@ -409,6 +439,9 @@ fn run_update(
             Ok(())
         }
         Err(error) => {
+            if live {
+                eprint!("\r\x1b[2K");
+            }
             eprintln!("CargoScope could not update crates.io data: {error}");
             Err(ExitCode::from(2))
         }
