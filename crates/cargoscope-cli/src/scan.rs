@@ -80,6 +80,23 @@ impl ColorChoice {
     }
 }
 
+/// The width the text report fits in: `COLUMNS` when set, else the width of
+/// the terminal that standard output is, else unknown.
+pub(crate) fn terminal_width(writes_to_file: bool) -> Option<usize> {
+    if let Some(columns) = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&columns| columns > 0)
+    {
+        return Some(columns);
+    }
+    if writes_to_file {
+        return None;
+    }
+    terminal_size::terminal_size_of(std::io::stdout())
+        .map(|(terminal_size::Width(columns), _)| usize::from(columns))
+}
+
 pub fn parse_scan_options(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<ScanOptions, String> {
@@ -208,6 +225,7 @@ pub fn scan(options: &ScanOptions) -> ExitCode {
 }
 
 fn run_scan(options: &ScanOptions) -> Result<ExitCode, ExitCode> {
+    let started = std::time::Instant::now();
     let root = options.path.as_path();
     let inventory = cargoscope_cargo::scan_cargo_project(root)
         .map_err(|error| execution_error(root, &error))?;
@@ -324,6 +342,23 @@ fn run_scan(options: &ScanOptions) -> Result<ExitCode, ExitCode> {
             policy_active = Some(packages);
         }
     }
+    // Without `[graph]`, what any feature or platform builds: an advisory in a
+    // crate nothing builds is unlikely to matter. `cargo tree --offline` only
+    // reads the manifests; when it cannot run, no advisory is ranked that way.
+    if policy_active.is_none() && !advisories.is_empty() {
+        match cargoscope_cargo::targets::built_packages(root) {
+            Ok(packages) => policy_active = Some(packages),
+            Err(error) => warnings.push(format!(
+                "advisory relevance: `cargo tree --offline` could not list what the project builds ({}); run `cargo fetch` so that advisories in crates no feature builds are ranked unlikely",
+                error
+                    .lines()
+                    .next()
+                    .unwrap_or("failed")
+                    .trim_start_matches("`cargo tree`: ")
+                    .trim_start_matches("error: ")
+            )),
+        }
+    }
 
     // Only labels in the report: a failure leaves the dependencies unlabelled.
     let direct_kinds = cargoscope_cargo::direct_dependency_kinds(root).unwrap_or_default();
@@ -359,7 +394,7 @@ fn run_scan(options: &ScanOptions) -> Result<ExitCode, ExitCode> {
         advisory_db_date,
         warnings,
     };
-    write_report(options, &report)?;
+    write_report(options, &report, started.elapsed())?;
     exit_code(
         options,
         &report,
@@ -603,16 +638,44 @@ fn short_function_name(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-fn format_functions(functions: &[String]) -> String {
-    let mut shown: Vec<String> = functions
+/// The affected functions in words, with the verb that agrees with them:
+/// "`decompress()` is" or "`Seekable::decompress()`, `AdvancedSeekable::decompress()` are".
+/// Functions that share a name are shown with their type, and duplicates once.
+fn format_functions(functions: &[String]) -> (String, &'static str) {
+    let short_names: Vec<&str> = functions
+        .iter()
+        .map(|path| short_function_name(path))
+        .collect();
+    let mut labels: Vec<String> = Vec::new();
+    for (path, name) in functions.iter().zip(&short_names) {
+        let shared = short_names.iter().filter(|other| *other == name).count() > 1;
+        let label = if shared {
+            // `zstd_safe::seekable::Seekable::decompress` -> `Seekable::decompress`
+            let mut parts: Vec<&str> = path
+                .trim()
+                .trim_end_matches("()")
+                .rsplit("::")
+                .take(2)
+                .collect();
+            parts.reverse();
+            parts.join("::")
+        } else {
+            (*name).to_owned()
+        };
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    let count = labels.len();
+    let mut shown: Vec<String> = labels
         .iter()
         .take(2)
-        .map(|path| format!("`{}()`", short_function_name(path)))
+        .map(|label| format!("`{label}()`"))
         .collect();
-    if functions.len() > 2 {
-        shown.push(format!("+{} more", functions.len() - 2));
+    if count > 2 {
+        shown.push(format!("+{} more", count - 2));
     }
-    shown.join(", ")
+    (shown.join(", "), if count > 1 { "are" } else { "is" })
 }
 
 /// Evaluates how likely each advisory is to affect the scanned project's shipped
@@ -699,15 +762,15 @@ pub(crate) fn evaluate_advisory_relevance(
                     .dependents_of(finding.package)
                     .into_iter()
                     .any(|idx| !inventory.packages[idx].root);
-                let list = format_functions(&finding.affected_functions);
+                let (list, verb) = format_functions(&finding.affected_functions);
                 if pkg.direct && !used_by_other_dep {
                     finding.relevance = AdvisoryRelevance::Unlikely;
                     finding.relevance_reason =
-                        Some(format!("{list} is never called in project sources"));
+                        Some(format!("{list} {verb} never called in project sources"));
                 } else {
                     finding.relevance = AdvisoryRelevance::Possibly;
                     finding.relevance_reason = Some(format!(
-                        "{list} is not called directly in project sources (used transitively)"
+                        "{list} {verb} not called directly in project sources (used transitively)"
                     ));
                 }
             }
@@ -732,7 +795,11 @@ fn keep_checked_info(package_info: &mut [PackageInfo], checks: Checks) {
 }
 
 /// Renders the report in the chosen format, to `--output` or standard output.
-fn write_report(options: &ScanOptions, report: &Report) -> Result<(), ExitCode> {
+fn write_report(
+    options: &ScanOptions,
+    report: &Report,
+    elapsed: std::time::Duration,
+) -> Result<(), ExitCode> {
     let root = options.path.as_path();
     let rendered = match options.format {
         OutputFormat::Text => cargoscope_report::render_text(
@@ -743,6 +810,8 @@ fn write_report(options: &ScanOptions, report: &Report) -> Result<(), ExitCode> 
                 verbose: options.verbose,
                 color: options.color.enabled(options.output.is_some()),
                 next_steps: true,
+                duration_ms: Some(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)),
+                width: terminal_width(options.output.is_some()),
             },
         ),
         OutputFormat::Json => cargoscope_report::render_json(root, report),
@@ -875,6 +944,36 @@ fn sarif_locations(root: &Path, report: &Report) -> SarifLocations {
 #[cfg(test)]
 mod tests {
     use super::{ActivePackages, OutputFormat, parse_scan_options};
+
+    #[test]
+    fn affected_functions_read_well() {
+        let list = |paths: &[&str]| {
+            super::format_functions(&paths.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            list(&["zstd_safe::DCtx::decompress_stream"]),
+            ("`decompress_stream()`".to_owned(), "is")
+        );
+        // Same name on two types: keep the type, so the names differ.
+        assert_eq!(
+            list(&[
+                "zstd_safe::seekable::Seekable::decompress",
+                "zstd_safe::seekable::AdvancedSeekable::decompress",
+            ]),
+            (
+                "`Seekable::decompress()`, `AdvancedSeekable::decompress()`".to_owned(),
+                "are"
+            )
+        );
+        assert_eq!(
+            list(&[
+                "rustix::fs::fgetxattr",
+                "rustix::fs::flistxattr",
+                "rustix::fs::fremovexattr"
+            ]),
+            ("`fgetxattr()`, `flistxattr()`, +1 more".to_owned(), "are")
+        );
+    }
     use crate::FailOn;
     use cargoscope_core::{AdvisoryFinding, AdvisoryKind, Inventory, Severity};
     use std::collections::{BTreeMap, BTreeSet};
