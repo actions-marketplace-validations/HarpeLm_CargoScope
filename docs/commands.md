@@ -133,12 +133,32 @@ Combines shared advisories (with relevance), policy violations, licenses, outdat
 
 ## `cargoscope why`
 
-Explains why a crate exists in `Cargo.lock`, listing direct dependents, reverse dependency paths from every workspace root, and pruning weights:
+Explains why a crate exists in `Cargo.lock`:
 
 ```sh
-cargoscope why serde_json
-cargoscope why serde_json --format json
+cargoscope why quick-xml
+cargoscope why quick-xml@0.39.2 --all-paths
+cargoscope why quick-xml --format json
 ```
+
+```text
+quick-xml 0.39.2 [transitive]
+  weight: 1 exclusive of 2 packages in its subtree
+  advisories (2): HIGH RUSTSEC-2026-0194, HIGH RUSTSEC-2026-0195
+  fix: 0.41.0, which wayland-scanner 0.31.10 does not accept yet: a new wayland-scanner release has to allow it first
+  dependents (1): wayland-scanner 0.31.10
+  used by members: data, halloy, ipc
+  paths from root (54, through 2 direct dependencies, shortest of each):
+    data 0.1.0 -> display-info 0.5.10 -> smithay-client-toolkit 0.20.0 -> wayland-scanner 0.31.10 -> quick-xml 0.39.2  +16 more
+    data 0.1.0 -> iced 0.15.0-dev -> iced_winit 0.15.0-dev -> winit 0.30.8 -> smithay-client-toolkit 0.19.2 -> wayland-scanner 0.31.10 -> quick-xml 0.39.2  +36 more  also from halloy
+  --all-paths lists every path
+```
+
+- **advisories** and **fix** come from the data of the last `cargoscope update` (offline). The fix is the smallest version that fixes every vulnerability: `cargo update` when it is within the SemVer range already required, a new requirement in `Cargo.toml` for a direct dependency, or, for a transitive crate, the crates that have to accept it first.
+- **yanked** shows when the version was withdrawn from crates.io.
+- **paths from root** counts every chain once, from the workspace member closest to the crate, and shows the shortest chain through each direct dependency with how many others go through it. `--all-paths` lists the chains themselves (up to 500).
+- **weight** is how many packages would leave `Cargo.lock` without the crate.
+- JSON gives all of it: `advisories`, `fix`, `yanked`, `members`, `path_count`, `routes` and the first `paths`.
 
 ---
 
@@ -200,6 +220,8 @@ Tries the smallest version that fixes **all** active advisories of each crate wi
 1. First runs `cargo update -p <name>@<version> --precise <fixed> --dry-run` (lockfile-only resolution; never compiles code).
 2. If a manifest requirement blocks the fix, retries with `set_requirement_for_version` updating matching declarations across `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, `[target.'...']`, member manifests, implicit local path crates, and `[workspace.dependencies]` (preserving pins such as `=0.4.19 -> =0.4.20`, `workspace = true` inheritance in members, comments, and formatting, while leaving unrelated major version lines elsewhere in the workspace and `path`/`git` entries untouched).
 3. Refuses edits when another dependency in the graph still keeps the vulnerable version in `Cargo.lock`, and prints Cargo's explanation. When earlier updates already pulled a crate past its target, skips or settles it back to the smallest fixed version.
+4. When the fix is a breaking version that the crates pulling the package in do not accept (`xcb 1.7.0 requires quick-xml ^0.30.0`), updates those crates within the range already required (`cargo update -p xcb@1.7.0 --dry-run`) and keeps that plan if the package lands on a fixed version: on halloy, xcb 1.7.1 and wayland-scanner 0.31.11 take quick-xml 0.41.0.
+5. Otherwise says which crates hold the fix back and whether a newer release of them is out (`a newer release may allow it: rusqlite 0.43.0 (a breaking update)`), instead of Cargo's raw resolution error. When nothing can be updated, the summary says so instead of suggesting `--apply`.
 
 ### Updating direct dependencies (`--updates`)
 
